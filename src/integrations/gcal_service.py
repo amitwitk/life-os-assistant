@@ -192,3 +192,56 @@ async def delete_event(event_id: str) -> None:
     except Exception as exc:
         logger.error("Failed to delete event with ID %s: %s", event_id, exc)
         raise CalendarError(f"Failed to delete event: {exc}") from exc
+
+
+async def update_event(event_id: str, new_date: str, new_time: str) -> dict:
+    """Update an existing Google Calendar event's date and time.
+
+    Args:
+        event_id: The ID of the event to update.
+        new_date: The new date for the event in YYYY-MM-DD format.
+        new_time: The new start time for the event in HH:MM (24-hour) format.
+
+    Returns:
+        The updated event dict.
+
+    Raises:
+        CalendarError: If the API call fails.
+    """
+    try:
+        service = get_calendar_service()
+        event = service.events().get(calendarId="primary", eventId=event_id).execute()
+
+        original_start_dt_str = event["start"].get("dateTime", event["start"].get("date"))
+        original_end_dt_str = event["end"].get("dateTime", event["end"].get("date"))
+
+        if "T" in original_start_dt_str and "T" in original_end_dt_str:
+            # Event has a specific time
+            original_start_dt = datetime.fromisoformat(original_start_dt_str)
+            original_end_dt = datetime.fromisoformat(original_end_dt_str)
+            duration = original_end_dt - original_start_dt
+        else:
+            # All-day event or event without specific time, default to 1 hour
+            duration = timedelta(hours=1)
+            logger.warning("Event %s has no specific time, defaulting duration to 1 hour.", event_id)
+
+
+        new_start_dt = datetime.strptime(f"{new_date} {new_time}", "%Y-%m-%d %H:%M")
+        new_end_dt = new_start_dt + duration
+
+        event["start"]["dateTime"] = new_start_dt.isoformat()
+        event["end"]["dateTime"] = new_end_dt.isoformat()
+
+        updated_event = service.events().update(
+            calendarId="primary", eventId=event_id, body=event
+        ).execute()
+
+        logger.info(
+            "Event %s updated to '%s' on %s at %s",
+            event_id, updated_event.get("summary", ""), new_date, new_time
+        )
+        return updated_event
+    except Exception as exc:
+        logger.error("Failed to update event with ID %s: %s", event_id, exc)
+        raise CalendarError(f"Failed to update event: {exc}") from exc
+

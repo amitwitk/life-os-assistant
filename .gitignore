@@ -22,6 +22,7 @@ __pycache__/
 
 # Token files
 token.json
+credentials.json
 
 # Claude Code
 .claude/
