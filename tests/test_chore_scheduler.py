@@ -1,7 +1,7 @@
 """Tests for src.core.chore_scheduler — slot finding logic."""
 
 import pytest
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, MagicMock
 
 from src.core.chore_scheduler import (
     find_best_slot,
@@ -54,6 +54,21 @@ class TestOverlapsAny:
 
 
 # ---------------------------------------------------------------------------
+# Helper: build a mock CalendarPort
+# ---------------------------------------------------------------------------
+
+
+def _mock_calendar(find_events_return=None, find_events_side_effect=None):
+    """Create a mock CalendarPort with configurable find_events."""
+    cal = MagicMock()
+    if find_events_side_effect is not None:
+        cal.find_events = AsyncMock(side_effect=find_events_side_effect)
+    else:
+        cal.find_events = AsyncMock(return_value=find_events_return or [])
+    return cal
+
+
+# ---------------------------------------------------------------------------
 # Integration test for find_best_slot
 # ---------------------------------------------------------------------------
 
@@ -61,16 +76,16 @@ class TestOverlapsAny:
 class TestFindBestSlot:
     @pytest.mark.asyncio
     async def test_finds_slot_with_empty_calendar(self):
-        mock_find = AsyncMock(return_value=[])
-        with patch("src.integrations.gcal_service.find_events", mock_find):
-            slot = await find_best_slot(
-                chore_name="Test chore",
-                frequency_days=7,
-                duration_minutes=30,
-                preferred_start="17:00",
-                preferred_end="21:00",
-                weeks_ahead=4,
-            )
+        cal = _mock_calendar(find_events_return=[])
+        slot = await find_best_slot(
+            calendar=cal,
+            chore_name="Test chore",
+            frequency_days=7,
+            duration_minutes=30,
+            preferred_start="17:00",
+            preferred_end="21:00",
+            weeks_ahead=4,
+        )
         assert slot is not None
         assert slot["start_time"] == "17:00"
         assert slot["end_time"] == "17:30"
@@ -80,18 +95,18 @@ class TestFindBestSlot:
     @pytest.mark.asyncio
     async def test_avoids_busy_slot(self):
         """If 17:00-17:30 is busy, scheduler should pick 17:30 or later."""
-        mock_find = AsyncMock(return_value=[
+        cal = _mock_calendar(find_events_return=[
             {"start_time": "17:00", "end_time": "17:45", "summary": "Existing"},
         ])
-        with patch("src.integrations.gcal_service.find_events", mock_find):
-            slot = await find_best_slot(
-                chore_name="Test chore",
-                frequency_days=7,
-                duration_minutes=30,
-                preferred_start="17:00",
-                preferred_end="21:00",
-                weeks_ahead=2,
-            )
+        slot = await find_best_slot(
+            calendar=cal,
+            chore_name="Test chore",
+            frequency_days=7,
+            duration_minutes=30,
+            preferred_start="17:00",
+            preferred_end="21:00",
+            weeks_ahead=2,
+        )
         assert slot is not None
         # Should have picked 17:45 or later (next 15-min boundary after busy period)
         start_minutes = int(slot["start_time"].split(":")[0]) * 60 + int(slot["start_time"].split(":")[1])
@@ -102,48 +117,48 @@ class TestFindBestSlot:
         """If the entire preferred window is busy, scheduler still returns the
         best-scored slot (least conflicts) rather than None — it's a best-effort
         approach since future days may be free."""
-        mock_find = AsyncMock(return_value=[
+        cal = _mock_calendar(find_events_return=[
             {"start_time": "17:00", "end_time": "21:00", "summary": "All day busy"},
         ])
-        with patch("src.integrations.gcal_service.find_events", mock_find):
-            slot = await find_best_slot(
-                chore_name="Test chore",
-                frequency_days=7,
-                duration_minutes=30,
-                preferred_start="17:00",
-                preferred_end="21:00",
-                weeks_ahead=2,
-            )
+        slot = await find_best_slot(
+            calendar=cal,
+            chore_name="Test chore",
+            frequency_days=7,
+            duration_minutes=30,
+            preferred_start="17:00",
+            preferred_end="21:00",
+            weeks_ahead=2,
+        )
         # Still returns a slot (best-effort); score is 0 but slot exists
         assert slot is not None
         assert slot["start_time"] == "17:00"
 
     @pytest.mark.asyncio
     async def test_returns_none_when_duration_exceeds_window(self):
-        mock_find = AsyncMock(return_value=[])
-        with patch("src.integrations.gcal_service.find_events", mock_find):
-            slot = await find_best_slot(
-                chore_name="Long chore",
-                frequency_days=7,
-                duration_minutes=300,  # 5 hours
-                preferred_start="17:00",
-                preferred_end="18:00",  # 1 hour window
-                weeks_ahead=2,
-            )
+        cal = _mock_calendar(find_events_return=[])
+        slot = await find_best_slot(
+            calendar=cal,
+            chore_name="Long chore",
+            frequency_days=7,
+            duration_minutes=300,  # 5 hours
+            preferred_start="17:00",
+            preferred_end="18:00",  # 1 hour window
+            weeks_ahead=2,
+        )
         assert slot is None
 
     @pytest.mark.asyncio
     async def test_calendar_error_gracefully_handled(self):
         """If calendar API fails, scheduler should still find slots (assumes free)."""
-        mock_find = AsyncMock(side_effect=Exception("API error"))
-        with patch("src.integrations.gcal_service.find_events", mock_find):
-            slot = await find_best_slot(
-                chore_name="Test",
-                frequency_days=7,
-                duration_minutes=30,
-                preferred_start="09:00",
-                preferred_end="21:00",
-                weeks_ahead=2,
-            )
+        cal = _mock_calendar(find_events_side_effect=Exception("API error"))
+        slot = await find_best_slot(
+            calendar=cal,
+            chore_name="Test",
+            frequency_days=7,
+            duration_minutes=30,
+            preferred_start="09:00",
+            preferred_end="21:00",
+            weeks_ahead=2,
+        )
         # Should still return a slot (defaults to free schedule)
         assert slot is not None

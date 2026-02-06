@@ -8,3 +8,11 @@ google-generativeai>=0.8.0
 cohere>=5.0.0
 python-dotenv==1.0.1
 pydantic==2.9.2
+
+# Outlook/365 calendar (optional — install if CALENDAR_PROVIDER=outlook)
+msgraph-sdk>=1.0.0
+azure-identity>=1.15.0
+
+# CalDAV calendar (optional — install if CALENDAR_PROVIDER=caldav)
+caldav>=1.3.0
+icalendar>=5.0.0

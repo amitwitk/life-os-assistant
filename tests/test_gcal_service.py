@@ -1,4 +1,4 @@
-"""Tests for src.integrations.gcal_service — Google Calendar operations.
+"""Tests for Google Calendar operations (adapter + backward-compat facade).
 
 All Google API calls are mocked.
 """
@@ -7,15 +7,21 @@ import pytest
 from unittest.mock import MagicMock, patch, AsyncMock
 from datetime import datetime
 
+from src.adapters.google_calendar import (
+    GoogleCalendarAdapter,
+    _build_event_body,
+)
+from src.ports.calendar_port import CalendarError
 from src.integrations.gcal_service import (
-    CalendarError,
     add_event,
     find_events,
     delete_event,
     add_recurring_event,
-    _build_event_body,
 )
 from src.core.parser import ParsedEvent
+
+# Patch path: the adapter is where get_calendar_service is actually called
+_PATCH_GCS = "src.adapters.google_calendar.get_calendar_service"
 
 
 # ---------------------------------------------------------------------------
@@ -68,7 +74,7 @@ class TestAddEvent:
     @pytest.mark.asyncio
     async def test_add_event_success(self):
         mock_svc = _mock_service(execute_return={"id": "evt1", "htmlLink": "https://..."})
-        with patch("src.integrations.gcal_service.get_calendar_service", return_value=mock_svc):
+        with patch(_PATCH_GCS, return_value=mock_svc):
             parsed = ParsedEvent(event="Test", date="2026-02-14", time="10:00")
             result = await add_event(parsed)
         assert result["id"] == "evt1"
@@ -77,7 +83,7 @@ class TestAddEvent:
     async def test_add_event_api_failure(self):
         mock_svc = MagicMock()
         mock_svc.events.return_value.insert.return_value.execute.side_effect = Exception("API down")
-        with patch("src.integrations.gcal_service.get_calendar_service", return_value=mock_svc):
+        with patch(_PATCH_GCS, return_value=mock_svc):
             parsed = ParsedEvent(event="Test", date="2026-02-14", time="10:00")
             with pytest.raises(CalendarError):
                 await add_event(parsed)
@@ -101,7 +107,7 @@ class TestFindEvents:
             }
         ]
         mock_svc = _mock_service(items=items)
-        with patch("src.integrations.gcal_service.get_calendar_service", return_value=mock_svc):
+        with patch(_PATCH_GCS, return_value=mock_svc):
             events = await find_events(target_date="2026-02-14")
         assert len(events) == 1
         assert events[0]["summary"] == "Meeting"
@@ -110,7 +116,7 @@ class TestFindEvents:
     @pytest.mark.asyncio
     async def test_find_events_empty(self):
         mock_svc = _mock_service(items=[])
-        with patch("src.integrations.gcal_service.get_calendar_service", return_value=mock_svc):
+        with patch(_PATCH_GCS, return_value=mock_svc):
             events = await find_events(target_date="2026-02-14")
         assert events == []
 
@@ -118,7 +124,7 @@ class TestFindEvents:
     async def test_find_events_api_failure(self):
         mock_svc = MagicMock()
         mock_svc.events.return_value.list.return_value.execute.side_effect = Exception("fail")
-        with patch("src.integrations.gcal_service.get_calendar_service", return_value=mock_svc):
+        with patch(_PATCH_GCS, return_value=mock_svc):
             with pytest.raises(CalendarError):
                 await find_events(target_date="2026-02-14")
 
@@ -132,7 +138,7 @@ class TestDeleteEvent:
     @pytest.mark.asyncio
     async def test_delete_event_success(self):
         mock_svc = _mock_service()
-        with patch("src.integrations.gcal_service.get_calendar_service", return_value=mock_svc):
+        with patch(_PATCH_GCS, return_value=mock_svc):
             await delete_event("evt1")
         mock_svc.events.return_value.delete.assert_called_once()
 
@@ -140,7 +146,7 @@ class TestDeleteEvent:
     async def test_delete_event_failure(self):
         mock_svc = MagicMock()
         mock_svc.events.return_value.delete.return_value.execute.side_effect = Exception("fail")
-        with patch("src.integrations.gcal_service.get_calendar_service", return_value=mock_svc):
+        with patch(_PATCH_GCS, return_value=mock_svc):
             with pytest.raises(CalendarError):
                 await delete_event("evt1")
 
@@ -154,7 +160,7 @@ class TestAddRecurringEvent:
     @pytest.mark.asyncio
     async def test_creates_weekly_rrule(self):
         mock_svc = _mock_service(execute_return={"id": "rec1", "htmlLink": "https://..."})
-        with patch("src.integrations.gcal_service.get_calendar_service", return_value=mock_svc):
+        with patch(_PATCH_GCS, return_value=mock_svc):
             result = await add_recurring_event(
                 summary="Chore", description="Test",
                 start_date="2026-02-08", start_time="17:00", end_time="17:30",
@@ -168,7 +174,7 @@ class TestAddRecurringEvent:
     @pytest.mark.asyncio
     async def test_creates_daily_rrule(self):
         mock_svc = _mock_service(execute_return={"id": "rec2"})
-        with patch("src.integrations.gcal_service.get_calendar_service", return_value=mock_svc):
+        with patch(_PATCH_GCS, return_value=mock_svc):
             await add_recurring_event(
                 summary="Daily chore", description="",
                 start_date="2026-02-08", start_time="09:00", end_time="09:30",
@@ -180,7 +186,7 @@ class TestAddRecurringEvent:
     @pytest.mark.asyncio
     async def test_creates_interval_rrule(self):
         mock_svc = _mock_service(execute_return={"id": "rec3"})
-        with patch("src.integrations.gcal_service.get_calendar_service", return_value=mock_svc):
+        with patch(_PATCH_GCS, return_value=mock_svc):
             await add_recurring_event(
                 summary="Every 3 days", description="",
                 start_date="2026-02-08", start_time="10:00", end_time="10:45",
@@ -193,7 +199,7 @@ class TestAddRecurringEvent:
     async def test_api_failure_raises(self):
         mock_svc = MagicMock()
         mock_svc.events.return_value.insert.return_value.execute.side_effect = Exception("fail")
-        with patch("src.integrations.gcal_service.get_calendar_service", return_value=mock_svc):
+        with patch(_PATCH_GCS, return_value=mock_svc):
             with pytest.raises(CalendarError):
                 await add_recurring_event(
                     summary="Fail", description="",

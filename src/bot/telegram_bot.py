@@ -12,9 +12,11 @@ from __future__ import annotations
 
 import logging
 import tempfile
+from datetime import time as dt_time
 from functools import wraps
 from pathlib import Path
-from typing import Any, Callable, Coroutine
+from typing import TYPE_CHECKING, Any, Callable, Coroutine
+from zoneinfo import ZoneInfo
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup, ReplyKeyboardRemove, Update
 from telegram.ext import (
@@ -28,7 +30,12 @@ from telegram.ext import (
     filters,
 )
 
+from src.ports.calendar_port import CalendarError
 from src.config import settings
+
+if TYPE_CHECKING:
+    from src.ports.calendar_port import CalendarPort
+    from src.ports.notification_port import NotificationPort
 
 logger = logging.getLogger(__name__)
 
@@ -67,15 +74,10 @@ def authorized_only(
 async def _process_text(
     text: str, update: Update, context: ContextTypes.DEFAULT_TYPE
 ) -> None:
-    """Shared logic: parse text via LLM -> create or cancel Google Calendar event."""
+    """Shared logic: parse text via LLM -> create or cancel calendar event."""
     from src.core.parser import CancelEvent, ParsedEvent, QueryEvents, RescheduleEvent, match_event, parse_message
-    from src.integrations.gcal_service import (
-        CalendarError,
-        add_event,
-        delete_event,
-        find_events,
-        update_event,
-    )
+
+    calendar: CalendarPort = context.bot_data["calendar"]
 
     try:
         parsed = await parse_message(text)
@@ -97,7 +99,7 @@ async def _process_text(
 
     if isinstance(parsed, ParsedEvent):
         try:
-            created = await add_event(parsed)
+            created = await calendar.add_event(parsed)
             link = created.get("htmlLink", "")
             msg = f"✅ Event created: *{parsed.event}* on {parsed.date} at {parsed.time}"
             if link:
@@ -111,7 +113,7 @@ async def _process_text(
             )
     elif isinstance(parsed, CancelEvent):
         try:
-            all_events = await find_events(target_date=parsed.date)
+            all_events = await calendar.find_events(target_date=parsed.date)
             if not all_events:
                 await update.message.reply_text(
                     f"There are no events on {parsed.date} to cancel."
@@ -127,7 +129,7 @@ async def _process_text(
                 )
                 return
 
-            await delete_event(matched["id"])
+            await calendar.delete_event(matched["id"])
             await update.message.reply_text(
                 f"✅ Event canceled: *{matched['summary']}*",
                 parse_mode="Markdown",
@@ -139,7 +141,7 @@ async def _process_text(
             )
     elif isinstance(parsed, RescheduleEvent):
         try:
-            all_events = await find_events(target_date=parsed.original_date)
+            all_events = await calendar.find_events(target_date=parsed.original_date)
             if not all_events:
                 await update.message.reply_text(
                     f"There are no events on {parsed.original_date} to reschedule."
@@ -155,7 +157,7 @@ async def _process_text(
                 )
                 return
 
-            updated = await update_event(
+            updated = await calendar.update_event(
                 matched["id"], parsed.original_date, parsed.new_time
             )
             link = updated.get("htmlLink", "")
@@ -173,7 +175,7 @@ async def _process_text(
             )
     elif isinstance(parsed, QueryEvents):
         try:
-            events = await find_events(target_date=parsed.date)
+            events = await calendar.find_events(target_date=parsed.date)
             if not events:
                 await update.message.reply_text(f"No events scheduled for {parsed.date}.")
                 return
@@ -235,10 +237,10 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 @authorized_only
 async def cmd_today(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Handle /today — show today's calendar events."""
-    from src.integrations.gcal_service import CalendarError, get_daily_events
+    calendar: CalendarPort = context.bot_data["calendar"]
 
     try:
-        events = await get_daily_events()
+        events = await calendar.get_daily_events()
     except CalendarError as exc:
         logger.error("/today calendar error: %s", exc)
         await update.message.reply_text("Couldn't fetch today's events. Please try again later.")
@@ -422,8 +424,11 @@ async def addchore_weeks(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
     await update.message.reply_text("Finding the best time slot...")
 
+    calendar: CalendarPort = context.bot_data["calendar"]
+
     try:
         slot = await find_best_slot(
+            calendar=calendar,
             chore_name=context.user_data["chore_name"],
             frequency_days=context.user_data["chore_freq"],
             duration_minutes=context.user_data["chore_duration"],
@@ -473,7 +478,8 @@ async def addchore_weeks(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 async def addchore_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     """Handle user confirmation — create DB entry and recurring calendar event."""
     from src.data.db import ChoreDB
-    from src.integrations.gcal_service import CalendarError, add_recurring_event
+
+    calendar: CalendarPort = context.bot_data["calendar"]
 
     answer = update.message.text.strip().lower()
     if answer not in ("yes", "y"):
@@ -510,7 +516,7 @@ async def addchore_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE) -
 
     # Create recurring calendar event
     try:
-        created = await add_recurring_event(
+        created = await calendar.add_recurring_event(
             summary=f"🧹 {name}",
             description=f"Chore: {name}\nChore ID: {chore.id}",
             start_date=slot["start_date"],
@@ -651,7 +657,8 @@ async def _handle_deletechore_callback(
 ) -> None:
     """Handle the inline button tap to delete a chore."""
     from src.data.db import ChoreDB
-    from src.integrations.gcal_service import CalendarError, delete_event
+
+    calendar: CalendarPort = context.bot_data["calendar"]
 
     query = update.callback_query
     await query.answer()
@@ -674,7 +681,7 @@ async def _handle_deletechore_callback(
         cal_deleted = False
         if chore.calendar_event_id:
             try:
-                await delete_event(chore.calendar_event_id)
+                await calendar.delete_event(chore.calendar_event_id)
                 cal_deleted = True
             except CalendarError as exc:
                 logger.error("Failed to delete calendar event for chore #%d: %s", chore_id, exc)
@@ -752,9 +759,31 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 # ---------------------------------------------------------------------------
 
 
-def build_app() -> Application:
-    """Build and configure the Telegram Application with all handlers."""
+def build_app(
+    calendar: CalendarPort | None = None,
+    notifier: NotificationPort | None = None,
+) -> Application:
+    """Build and configure the Telegram Application with all handlers.
+
+    Args:
+        calendar: Calendar port implementation. Defaults to GoogleCalendarAdapter.
+        notifier: Notification port implementation. Defaults to TelegramNotifier
+                  (created from the bot instance after app is built).
+    """
     app = ApplicationBuilder().token(settings.TELEGRAM_BOT_TOKEN).build()
+
+    # Wire default adapters if not provided
+    if calendar is None:
+        from src.adapters.calendar_factory import create_calendar_adapter
+        calendar = create_calendar_adapter()
+
+    if notifier is None:
+        from src.adapters.telegram_notifier import TelegramNotifier
+        notifier = TelegramNotifier(app.bot)
+
+    # Store ports in bot_data for handler access
+    app.bot_data["calendar"] = calendar
+    app.bot_data["notifier"] = notifier
 
     # Commands
     app.add_handler(CommandHandler("start", cmd_start))
@@ -787,12 +816,38 @@ def build_app() -> Application:
     # Voice messages
     app.add_handler(MessageHandler(filters.VOICE, handle_voice))
 
-    # Morning Briefing scheduler (Phase 4)
-    from src.core.scheduler import setup_scheduler
-    setup_scheduler(app)
+    # Morning Briefing scheduler — Telegram-specific scheduling logic
+    _setup_morning_briefing(app, calendar, notifier)
 
     logger.info("Telegram bot application built with %d handlers", len(app.handlers[0]))
     return app
+
+
+def _setup_morning_briefing(
+    app: Application,
+    calendar: CalendarPort,
+    notifier: NotificationPort,
+) -> None:
+    """Register the daily morning briefing job at 08:00 Asia/Jerusalem."""
+    from src.core.scheduler import send_morning_summary
+
+    tz = ZoneInfo(settings.TIMEZONE)
+    briefing_time = dt_time(hour=settings.MORNING_BRIEFING_HOUR, minute=0, tzinfo=tz)
+
+    async def _morning_job_callback(context: ContextTypes.DEFAULT_TYPE) -> None:
+        await send_morning_summary(calendar, notifier)
+
+    app.job_queue.run_daily(
+        _morning_job_callback,
+        time=briefing_time,
+        name="morning_briefing",
+    )
+
+    logger.info(
+        "Morning briefing scheduled at %02d:00 %s",
+        settings.MORNING_BRIEFING_HOUR,
+        settings.TIMEZONE,
+    )
 
 
 def main() -> None:
