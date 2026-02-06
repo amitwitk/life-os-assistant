@@ -370,6 +370,10 @@ def build_app() -> Application:
     # Voice messages
     app.add_handler(MessageHandler(filters.VOICE, handle_voice))
 
+    # Morning Briefing scheduler (Phase 4)
+    from src.core.scheduler import setup_scheduler
+    setup_scheduler(app)
+
     logger.info("Telegram bot application built with %d handlers", len(app.handlers[0]))
     return app
 
