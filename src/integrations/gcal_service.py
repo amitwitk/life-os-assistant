@@ -103,6 +103,25 @@ async def get_daily_events(target_date: str | None = None) -> list[dict]:
     Raises:
         CalendarError: If the Google Calendar API call fails.
     """
+    return await find_events(target_date=target_date)
+
+
+async def find_events(
+    query: str | None = None, target_date: str | None = None
+) -> list[dict]:
+    """Fetch all calendar events for a given date.
+
+    Args:
+        query: Optional text to search for in event summaries.
+        target_date: Date in YYYY-MM-DD format. Defaults to today.
+
+    Returns:
+        List of simplified event dicts with keys:
+        id, summary, start_time, end_time, description.
+
+    Raises:
+        CalendarError: If the Google Calendar API call fails.
+    """
     if target_date is None:
         target_date = date.today().isoformat()
 
@@ -116,6 +135,7 @@ async def get_daily_events(target_date: str | None = None) -> list[dict]:
             service.events()
             .list(
                 calendarId="primary",
+                q=query,
                 timeMin=time_min,
                 timeMax=time_max,
                 singleEvents=True,
@@ -138,9 +158,37 @@ async def get_daily_events(target_date: str | None = None) -> list[dict]:
                 }
             )
 
-        logger.info("Fetched %d event(s) for %s", len(events), target_date)
+        logger.info(
+            "Found %d event(s) for query='%s' on %s",
+            len(events),
+            query,
+            target_date,
+        )
         return events
 
     except Exception as exc:
-        logger.error("Failed to fetch events for %s: %s", target_date, exc)
-        raise CalendarError(f"Failed to fetch events: {exc}") from exc
+        logger.error(
+            "Failed to find events for query='%s' on %s: %s",
+            query,
+            target_date,
+            exc,
+        )
+        raise CalendarError(f"Failed to find events: {exc}") from exc
+
+
+async def delete_event(event_id: str) -> None:
+    """Delete a Google Calendar event by its ID.
+
+    Args:
+        event_id: The ID of the event to delete.
+
+    Raises:
+        CalendarError: If the API call fails.
+    """
+    try:
+        service = get_calendar_service()
+        service.events().delete(calendarId="primary", eventId=event_id).execute()
+        logger.info("Event with ID %s deleted successfully.", event_id)
+    except Exception as exc:
+        logger.error("Failed to delete event with ID %s: %s", event_id, exc)
+        raise CalendarError(f"Failed to delete event: {exc}") from exc

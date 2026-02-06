@@ -63,12 +63,17 @@ def authorized_only(
 # ---------------------------------------------------------------------------
 
 
-async def _process_text_to_event(
+async def _process_text(
     text: str, update: Update, context: ContextTypes.DEFAULT_TYPE
 ) -> None:
-    """Shared logic: parse text via Claude → create Google Calendar event."""
-    from src.core.parser import parse_message
-    from src.integrations.gcal_service import CalendarError, add_event
+    """Shared logic: parse text via LLM -> create or cancel Google Calendar event."""
+    from src.core.parser import CancelEvent, ParsedEvent, parse_message
+    from src.integrations.gcal_service import (
+        CalendarError,
+        add_event,
+        delete_event,
+        find_events,
+    )
 
     try:
         parsed = await parse_message(text)
@@ -81,24 +86,50 @@ async def _process_text_to_event(
 
     if parsed is None:
         await update.message.reply_text(
-            "I couldn't find any event details in your message. "
-            "Try something like: 'Meeting with Dan tomorrow at 14:00'"
+            "I couldn't find any actionable information in your message. "
+            "Try something like: 'Meeting with Dan tomorrow at 14:00' "
+            "or 'Cancel my meeting with Dan tomorrow'."
         )
         return
 
-    try:
-        created = await add_event(parsed)
-        link = created.get("htmlLink", "")
-        msg = f"✅ Event created: *{parsed.event}* on {parsed.date} at {parsed.time}"
-        if link:
-            msg += f"\n[Open in Google Calendar]({link})"
-        await update.message.reply_text(msg, parse_mode="Markdown")
-    except CalendarError as exc:
-        logger.error("Calendar write error: %s", exc)
-        await update.message.reply_text(
-            "I parsed your event but couldn't save it to Google Calendar. "
-            "Please try again later."
-        )
+    if isinstance(parsed, ParsedEvent):
+        try:
+            created = await add_event(parsed)
+            link = created.get("htmlLink", "")
+            msg = f"✅ Event created: *{parsed.event}* on {parsed.date} at {parsed.time}"
+            if link:
+                msg += f"\n[Open in Google Calendar]({link})"
+            await update.message.reply_text(msg, parse_mode="Markdown")
+        except CalendarError as exc:
+            logger.error("Calendar write error: %s", exc)
+            await update.message.reply_text(
+                "I parsed your event but couldn't save it to Google Calendar. "
+                "Please try again later."
+            )
+    elif isinstance(parsed, CancelEvent):
+        try:
+            events = await find_events(
+                query=parsed.event_summary, target_date=parsed.date
+            )
+            if not events:
+                await update.message.reply_text(
+                    f"I couldn't find any event matching '{parsed.event_summary}' on {parsed.date}."
+                )
+                return
+
+            # For now, just cancel the first match.
+            # A more advanced version could ask the user for clarification if multiple events match.
+            event_to_cancel = events[0]
+            await delete_event(event_to_cancel["id"])
+            await update.message.reply_text(
+                f"✅ Event canceled: *{event_to_cancel['summary']}*",
+                parse_mode="Markdown",
+            )
+        except CalendarError as exc:
+            logger.error("Calendar delete error: %s", exc)
+            await update.message.reply_text(
+                "I found the event but couldn't cancel it. Please try again later."
+            )
 
 
 # ---------------------------------------------------------------------------
@@ -292,7 +323,7 @@ async def cmd_done(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Handle plain text messages — parse and create calendar event."""
     processing_msg = await update.message.reply_text("Processing...")
-    await _process_text_to_event(update.message.text, update, context)
+    await _process_text(update.message.text, update, context)
     try:
         await processing_msg.delete()
     except Exception:
@@ -320,7 +351,7 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
         # Show what was heard, then process
         await update.message.reply_text(f"🎤 I heard: {text}")
-        await _process_text_to_event(text, update, context)
+        await _process_text(text, update, context)
 
     except Exception as exc:
         logger.error("Voice handling error: %s", exc)
