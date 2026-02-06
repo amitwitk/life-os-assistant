@@ -11,7 +11,9 @@ Security-first: unauthorized users are silently ignored.
 from __future__ import annotations
 
 import logging
+import tempfile
 from functools import wraps
+from pathlib import Path
 from typing import Any, Callable, Coroutine
 
 from telegram import Update
@@ -118,6 +120,38 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     await update.message.reply_text(f"[Echo]: {update.message.text}")
 
 
+@authorized_only
+async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle voice messages — transcribe via Whisper, then echo (wired to parser in 3.3)."""
+    from src.core.transcriber import transcribe_audio
+
+    voice = update.message.voice
+    tmp_path: str | None = None
+
+    try:
+        # Download voice file to a temp directory
+        voice_file = await context.bot.get_file(voice.file_id)
+        with tempfile.NamedTemporaryFile(suffix=".ogg", delete=False) as tmp:
+            tmp_path = tmp.name
+        await voice_file.download_to_drive(tmp_path)
+
+        # Transcribe
+        text = await transcribe_audio(tmp_path)
+        logger.info("Voice transcribed: %s", text[:80])
+
+        await update.message.reply_text(f"🎤 I heard: {text}")
+    except Exception as exc:
+        logger.error("Voice handling error: %s", exc)
+        await update.message.reply_text("Sorry, I couldn't process your voice message. Please try again.")
+    finally:
+        # Cleanup temp file
+        if tmp_path:
+            try:
+                Path(tmp_path).unlink(missing_ok=True)
+            except OSError:
+                pass
+
+
 # ---------------------------------------------------------------------------
 # App builder
 # ---------------------------------------------------------------------------
@@ -137,6 +171,9 @@ def build_app() -> Application:
 
     # Text messages (non-command)
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
+
+    # Voice messages
+    app.add_handler(MessageHandler(filters.VOICE, handle_voice))
 
     logger.info("Telegram bot application built with %d handlers", len(app.handlers[0]))
     return app
