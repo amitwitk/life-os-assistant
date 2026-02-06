@@ -22,6 +22,7 @@ from telegram.ext import (
     ApplicationBuilder,
     CommandHandler,
     ContextTypes,
+    ConversationHandler,
     MessageHandler,
     filters,
 )
@@ -34,6 +35,7 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 # Security: silent-ignore decorator
 # ---------------------------------------------------------------------------
+
 
 def authorized_only(
     func: Callable[..., Coroutine[Any, Any, None]],
@@ -54,6 +56,49 @@ def authorized_only(
         return await func(update, context)
 
     return wrapper
+
+
+# ---------------------------------------------------------------------------
+# Capture System: parse text → create calendar event
+# ---------------------------------------------------------------------------
+
+
+async def _process_text_to_event(
+    text: str, update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> None:
+    """Shared logic: parse text via Claude → create Google Calendar event."""
+    from src.core.parser import parse_message
+    from src.integrations.gcal_service import CalendarError, add_event
+
+    try:
+        parsed = await parse_message(text)
+    except Exception as exc:
+        logger.error("Parser error: %s", exc)
+        await update.message.reply_text(
+            "Sorry, something went wrong while parsing your message. Please try again."
+        )
+        return
+
+    if parsed is None:
+        await update.message.reply_text(
+            "I couldn't find any event details in your message. "
+            "Try something like: 'Meeting with Dan tomorrow at 14:00'"
+        )
+        return
+
+    try:
+        created = await add_event(parsed)
+        link = created.get("htmlLink", "")
+        msg = f"✅ Event created: *{parsed.event}* on {parsed.date} at {parsed.time}"
+        if link:
+            msg += f"\n[Open in Google Calendar]({link})"
+        await update.message.reply_text(msg, parse_mode="Markdown")
+    except CalendarError as exc:
+        logger.error("Calendar write error: %s", exc)
+        await update.message.reply_text(
+            "I parsed your event but couldn't save it to Google Calendar. "
+            "Please try again later."
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -92,37 +137,171 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 @authorized_only
 async def cmd_today(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Handle /today — placeholder (wired in 3.3)."""
-    await update.message.reply_text("⏳ Feature coming soon.")
+    """Handle /today — show today's calendar events."""
+    from src.integrations.gcal_service import CalendarError, get_daily_events
+
+    try:
+        events = await get_daily_events()
+    except CalendarError as exc:
+        logger.error("/today calendar error: %s", exc)
+        await update.message.reply_text("Couldn't fetch today's events. Please try again later.")
+        return
+
+    if not events:
+        await update.message.reply_text("No events scheduled for today.")
+        return
+
+    lines = ["*Today's schedule:*\n"]
+    for ev in events:
+        start = ev.get("start_time", "")
+        # Extract HH:MM from ISO datetime
+        if "T" in start:
+            start = start.split("T")[1][:5]
+        end = ev.get("end_time", "")
+        if "T" in end:
+            end = end.split("T")[1][:5]
+        summary = ev.get("summary", "(no title)")
+        lines.append(f"• {start} – {end}  {summary}")
+
+    await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
+
+
+# ---------------------------------------------------------------------------
+# Chore commands (uses ChoreDB from Phase 4)
+# ---------------------------------------------------------------------------
+
+# ConversationHandler states for /addchore
+CHORE_NAME, CHORE_FREQ, CHORE_ASSIGNED = range(3)
 
 
 @authorized_only
-async def cmd_addchore(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Handle /addchore — placeholder (wired in 3.3)."""
-    await update.message.reply_text("⏳ Feature coming soon.")
+async def cmd_addchore(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Handle /addchore — start chore creation conversation."""
+    await update.message.reply_text("What's the chore name? (e.g., 'Take out trash')")
+    return CHORE_NAME
+
+
+async def addchore_name(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Receive chore name, ask for frequency."""
+    context.user_data["chore_name"] = update.message.text.strip()
+    await update.message.reply_text("How often (in days)? (e.g., 7 for weekly)")
+    return CHORE_FREQ
+
+
+async def addchore_freq(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Receive frequency, ask for assigned person."""
+    text = update.message.text.strip()
+    try:
+        freq = int(text)
+    except ValueError:
+        await update.message.reply_text("Please enter a number (e.g., 7 for weekly).")
+        return CHORE_FREQ
+    context.user_data["chore_freq"] = freq
+    await update.message.reply_text("Who is it assigned to?")
+    return CHORE_ASSIGNED
+
+
+async def addchore_assigned(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Receive assigned person, create the chore."""
+    from src.data.db import ChoreDB
+
+    assigned = update.message.text.strip()
+    name = context.user_data.pop("chore_name")
+    freq = context.user_data.pop("chore_freq")
+
+    try:
+        db = ChoreDB()
+        chore = db.add_chore(name=name, frequency_days=freq, assigned_to=assigned)
+        await update.message.reply_text(
+            f"✅ Chore added: *{chore.name}* (every {chore.frequency_days} days, "
+            f"assigned to {chore.assigned_to})",
+            parse_mode="Markdown",
+        )
+    except Exception as exc:
+        logger.error("Failed to add chore: %s", exc)
+        await update.message.reply_text("Sorry, couldn't save the chore. Please try again.")
+
+    return ConversationHandler.END
+
+
+async def addchore_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Cancel chore creation."""
+    context.user_data.pop("chore_name", None)
+    context.user_data.pop("chore_freq", None)
+    await update.message.reply_text("Chore creation cancelled.")
+    return ConversationHandler.END
 
 
 @authorized_only
 async def cmd_chores(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Handle /chores — placeholder (wired in 3.3)."""
-    await update.message.reply_text("⏳ Feature coming soon.")
+    """Handle /chores — list all active chores."""
+    from src.data.db import ChoreDB
+
+    try:
+        db = ChoreDB()
+        chores = db.list_all(active_only=True)
+    except Exception as exc:
+        logger.error("/chores error: %s", exc)
+        await update.message.reply_text("Couldn't load chores. Please try again.")
+        return
+
+    if not chores:
+        await update.message.reply_text("No active chores.")
+        return
+
+    lines = ["*Active chores:*\n"]
+    for c in chores:
+        lines.append(f"`{c.id}` — {c.name} (due: {c.next_due}, assigned: {c.assigned_to})")
+    await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
 
 
 @authorized_only
 async def cmd_done(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Handle /done — placeholder (wired in 3.3)."""
-    await update.message.reply_text("⏳ Feature coming soon.")
+    """Handle /done <id> — mark a chore as done."""
+    from src.data.db import ChoreDB
+
+    args = context.args
+    if not args:
+        await update.message.reply_text("Usage: /done <chore_id>\nUse /chores to see IDs.")
+        return
+
+    try:
+        chore_id = int(args[0])
+    except ValueError:
+        await update.message.reply_text("Invalid chore ID. Use /chores to see valid IDs.")
+        return
+
+    try:
+        db = ChoreDB()
+        chore = db.mark_done(chore_id)
+        await update.message.reply_text(
+            f"✅ Marked '*{chore.name}*' as done. Next due: {chore.next_due}",
+            parse_mode="Markdown",
+        )
+    except Exception as exc:
+        logger.error("/done error: %s", exc)
+        await update.message.reply_text(f"Couldn't mark chore {chore_id} as done. Please check the ID.")
+
+
+# ---------------------------------------------------------------------------
+# Message handlers
+# ---------------------------------------------------------------------------
 
 
 @authorized_only
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Handle plain text messages — echo for now (replaced in 3.3)."""
-    await update.message.reply_text(f"[Echo]: {update.message.text}")
+    """Handle plain text messages — parse and create calendar event."""
+    processing_msg = await update.message.reply_text("Processing...")
+    await _process_text_to_event(update.message.text, update, context)
+    try:
+        await processing_msg.delete()
+    except Exception:
+        pass  # Non-critical if delete fails
 
 
 @authorized_only
 async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Handle voice messages — transcribe via Whisper, then echo (wired to parser in 3.3)."""
+    """Handle voice messages — transcribe via Whisper, then parse → calendar."""
     from src.core.transcriber import transcribe_audio
 
     voice = update.message.voice
@@ -139,10 +318,15 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         text = await transcribe_audio(tmp_path)
         logger.info("Voice transcribed: %s", text[:80])
 
+        # Show what was heard, then process
         await update.message.reply_text(f"🎤 I heard: {text}")
+        await _process_text_to_event(text, update, context)
+
     except Exception as exc:
         logger.error("Voice handling error: %s", exc)
-        await update.message.reply_text("Sorry, I couldn't process your voice message. Please try again.")
+        await update.message.reply_text(
+            "Sorry, I couldn't process your voice message. Please try again."
+        )
     finally:
         # Cleanup temp file
         if tmp_path:
@@ -165,9 +349,20 @@ def build_app() -> Application:
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("help", cmd_help))
     app.add_handler(CommandHandler("today", cmd_today))
-    app.add_handler(CommandHandler("addchore", cmd_addchore))
     app.add_handler(CommandHandler("chores", cmd_chores))
     app.add_handler(CommandHandler("done", cmd_done))
+
+    # /addchore conversation handler
+    addchore_conv = ConversationHandler(
+        entry_points=[CommandHandler("addchore", cmd_addchore)],
+        states={
+            CHORE_NAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, addchore_name)],
+            CHORE_FREQ: [MessageHandler(filters.TEXT & ~filters.COMMAND, addchore_freq)],
+            CHORE_ASSIGNED: [MessageHandler(filters.TEXT & ~filters.COMMAND, addchore_assigned)],
+        },
+        fallbacks=[CommandHandler("cancel", addchore_cancel)],
+    )
+    app.add_handler(addchore_conv)
 
     # Text messages (non-command)
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
