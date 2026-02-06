@@ -67,7 +67,7 @@ async def _process_text(
     text: str, update: Update, context: ContextTypes.DEFAULT_TYPE
 ) -> None:
     """Shared logic: parse text via LLM -> create or cancel Google Calendar event."""
-    from src.core.parser import CancelEvent, ParsedEvent, RescheduleEvent, match_event, parse_message
+    from src.core.parser import CancelEvent, ParsedEvent, QueryEvents, RescheduleEvent, match_event, parse_message
     from src.integrations.gcal_service import (
         CalendarError,
         add_event,
@@ -169,6 +169,30 @@ async def _process_text(
             logger.error("Calendar reschedule error: %s", exc)
             await update.message.reply_text(
                 "I found the event but couldn't reschedule it. Please try again later."
+            )
+    elif isinstance(parsed, QueryEvents):
+        try:
+            events = await find_events(target_date=parsed.date)
+            if not events:
+                await update.message.reply_text(f"No events scheduled for {parsed.date}.")
+                return
+
+            lines = [f"*Events on {parsed.date}:*\n"]
+            for ev in events:
+                start = ev.get("start_time", "")
+                if "T" in start:
+                    start = start.split("T")[1][:5]
+                end = ev.get("end_time", "")
+                if "T" in end:
+                    end = end.split("T")[1][:5]
+                summary = ev.get("summary", "(no title)")
+                lines.append(f"• {start} – {end}  {summary}")
+
+            await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
+        except CalendarError as exc:
+            logger.error("Calendar query error: %s", exc)
+            await update.message.reply_text(
+                "Couldn't fetch events. Please try again later."
             )
 
 
