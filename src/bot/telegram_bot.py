@@ -16,10 +16,11 @@ from functools import wraps
 from pathlib import Path
 from typing import Any, Callable, Coroutine
 
-from telegram import Update
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup, ReplyKeyboardRemove, Update
 from telegram.ext import (
     Application,
     ApplicationBuilder,
+    CallbackQueryHandler,
     CommandHandler,
     ContextTypes,
     ConversationHandler,
@@ -225,6 +226,7 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "/addchore — Add a recurring chore\n"
         "/chores — List all active chores\n"
         "/done <id> — Mark a chore as done\n"
+        "/deletechore <id> — Delete a chore and its calendar events\n"
         "/help — Show this message",
         parse_mode="Markdown",
     )
@@ -266,7 +268,46 @@ async def cmd_today(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 # ---------------------------------------------------------------------------
 
 # ConversationHandler states for /addchore
-CHORE_NAME, CHORE_FREQ, CHORE_ASSIGNED = range(3)
+(
+    CHORE_NAME,
+    CHORE_FREQ,
+    CHORE_DURATION,
+    CHORE_TIME_PREF,
+    CHORE_WEEKS,
+    CHORE_CONFIRM,
+) = range(6)
+
+# Mapping for natural-language time preferences
+_TIME_PREF_MAP = {
+    "mornings": ("06:00", "12:00"),
+    "morning": ("06:00", "12:00"),
+    "afternoons": ("12:00", "17:00"),
+    "afternoon": ("12:00", "17:00"),
+    "evenings": ("17:00", "21:00"),
+    "evening": ("17:00", "21:00"),
+}
+
+
+def _parse_time_pref(text: str) -> tuple[str, str] | None:
+    """Parse a time preference string into (start, end) times.
+
+    Accepts: 'mornings', 'evenings', '17:00-20:00', etc.
+    Returns None if the input can't be parsed.
+    """
+    text = text.strip().lower()
+    if text in _TIME_PREF_MAP:
+        return _TIME_PREF_MAP[text]
+    # Try HH:MM-HH:MM format
+    if "-" in text:
+        parts = text.split("-", 1)
+        try:
+            from datetime import datetime as _dt
+            _dt.strptime(parts[0].strip(), "%H:%M")
+            _dt.strptime(parts[1].strip(), "%H:%M")
+            return (parts[0].strip(), parts[1].strip())
+        except ValueError:
+            pass
+    return None
 
 
 @authorized_only
@@ -279,52 +320,252 @@ async def cmd_addchore(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
 async def addchore_name(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     """Receive chore name, ask for frequency."""
     context.user_data["chore_name"] = update.message.text.strip()
-    await update.message.reply_text("How often (in days)? (e.g., 7 for weekly)")
+    keyboard = ReplyKeyboardMarkup(
+        [["1", "2", "3"], ["4", "5", "7"]],
+        one_time_keyboard=True,
+        resize_keyboard=True,
+    )
+    await update.message.reply_text(
+        "How many times a week?",
+        reply_markup=keyboard,
+    )
     return CHORE_FREQ
 
 
 async def addchore_freq(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Receive frequency, ask for assigned person."""
+    """Receive times-per-week, convert to frequency_days, ask for duration."""
     text = update.message.text.strip()
     try:
-        freq = int(text)
+        times_per_week = int(text)
+        if times_per_week < 1:
+            raise ValueError
     except ValueError:
-        await update.message.reply_text("Please enter a number (e.g., 7 for weekly).")
+        await update.message.reply_text("Please enter a number (e.g., 2 for twice a week).")
         return CHORE_FREQ
-    context.user_data["chore_freq"] = freq
-    await update.message.reply_text("Who is it assigned to?")
-    return CHORE_ASSIGNED
+    # Convert times-per-week → every N days (e.g., 2/week → every 3 days)
+    freq_days = max(1, 7 // times_per_week)
+    context.user_data["chore_freq"] = freq_days
+    context.user_data["chore_times_per_week"] = times_per_week
+    keyboard = ReplyKeyboardMarkup(
+        [["15", "30", "45"], ["60", "90", "120"]],
+        one_time_keyboard=True,
+        resize_keyboard=True,
+    )
+    await update.message.reply_text(
+        "How long does it take (in minutes)?",
+        reply_markup=keyboard,
+    )
+    return CHORE_DURATION
 
 
-async def addchore_assigned(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Receive assigned person, create the chore."""
-    from src.data.db import ChoreDB
+async def addchore_duration(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Receive duration, ask for time preference."""
+    text = update.message.text.strip()
+    try:
+        duration = int(text)
+    except ValueError:
+        await update.message.reply_text("Please enter a number of minutes (e.g., 30).")
+        return CHORE_DURATION
+    context.user_data["chore_duration"] = duration
+    # Auto-assign to the Telegram user
+    user = update.effective_user
+    context.user_data["chore_assigned"] = user.first_name if user else "Me"
+    keyboard = ReplyKeyboardMarkup(
+        [["Mornings", "Afternoons", "Evenings"]],
+        one_time_keyboard=True,
+        resize_keyboard=True,
+    )
+    await update.message.reply_text(
+        "When do you prefer to do it?\n"
+        "Pick an option or type a custom range (e.g., '17:00-20:00').",
+        reply_markup=keyboard,
+    )
+    return CHORE_TIME_PREF
 
-    assigned = update.message.text.strip()
-    name = context.user_data.pop("chore_name")
-    freq = context.user_data.pop("chore_freq")
+
+async def addchore_time_pref(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Receive time preference, ask for weeks ahead."""
+    text = update.message.text.strip()
+    parsed = _parse_time_pref(text)
+    if parsed is None:
+        await update.message.reply_text(
+            "I couldn't understand that. Please try: 'mornings', 'evenings', "
+            "or a range like '17:00-20:00'."
+        )
+        return CHORE_TIME_PREF
+    context.user_data["chore_time_start"], context.user_data["chore_time_end"] = parsed
+    keyboard = ReplyKeyboardMarkup(
+        [["2", "4", "6", "8"]],
+        one_time_keyboard=True,
+        resize_keyboard=True,
+    )
+    await update.message.reply_text(
+        "How many weeks ahead should I schedule?\n"
+        "Pick a quick option or type any number.",
+        reply_markup=keyboard,
+    )
+    return CHORE_WEEKS
+
+
+async def addchore_weeks(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Receive weeks ahead, find best recurring slot and present proposal."""
+    from src.core.chore_scheduler import find_best_slot
+
+    text = update.message.text.strip()
+    try:
+        weeks = int(text)
+    except ValueError:
+        await update.message.reply_text("Please enter a number (e.g., 4).")
+        return CHORE_WEEKS
+
+    context.user_data["chore_weeks"] = weeks
+
+    await update.message.reply_text("Finding the best time slot...")
 
     try:
-        db = ChoreDB()
-        chore = db.add_chore(name=name, frequency_days=freq, assigned_to=assigned)
+        slot = await find_best_slot(
+            chore_name=context.user_data["chore_name"],
+            frequency_days=context.user_data["chore_freq"],
+            duration_minutes=context.user_data["chore_duration"],
+            preferred_start=context.user_data["chore_time_start"],
+            preferred_end=context.user_data["chore_time_end"],
+            weeks_ahead=weeks,
+        )
+    except Exception as exc:
+        logger.error("Slot finding error: %s", exc)
         await update.message.reply_text(
-            f"✅ Chore added: *{chore.name}* (every {chore.frequency_days} days, "
-            f"assigned to {chore.assigned_to})",
-            parse_mode="Markdown",
+            "Sorry, couldn't find a slot. Please try again."
+        )
+        return ConversationHandler.END
+
+    if slot is None:
+        await update.message.reply_text(
+            "Couldn't find any open slot in the requested time range. "
+            "Try a wider time window or fewer weeks."
+        )
+        return ConversationHandler.END
+
+    context.user_data["chore_slot"] = slot
+
+    freq = context.user_data["chore_freq"]
+    lines = [
+        f"*Proposed recurring schedule for '{context.user_data['chore_name']}':*\n",
+        f"  Starting: {slot['start_date']}",
+        f"  Time: {slot['start_time']}–{slot['end_time']}",
+        f"  Repeats: every {freq} day(s)",
+        f"  Occurrences: {slot['occurrences']}",
+        "\n_This will create a single recurring calendar event._",
+        "_You can delete the entire series from Google Calendar._",
+        "\nConfirm?",
+    ]
+
+    keyboard = ReplyKeyboardMarkup(
+        [["Yes", "No"]],
+        one_time_keyboard=True,
+        resize_keyboard=True,
+    )
+    await update.message.reply_text(
+        "\n".join(lines), parse_mode="Markdown", reply_markup=keyboard,
+    )
+    return CHORE_CONFIRM
+
+
+async def addchore_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Handle user confirmation — create DB entry and recurring calendar event."""
+    from src.data.db import ChoreDB
+    from src.integrations.gcal_service import CalendarError, add_recurring_event
+
+    answer = update.message.text.strip().lower()
+    if answer not in ("yes", "y"):
+        await update.message.reply_text(
+            "Chore scheduling cancelled.", reply_markup=ReplyKeyboardRemove(),
+        )
+        _clear_chore_data(context)
+        return ConversationHandler.END
+
+    name = context.user_data["chore_name"]
+    freq = context.user_data["chore_freq"]
+    duration = context.user_data["chore_duration"]
+    assigned = context.user_data["chore_assigned"]
+    time_start = context.user_data["chore_time_start"]
+    time_end = context.user_data["chore_time_end"]
+    slot = context.user_data["chore_slot"]
+
+    # Save chore to DB
+    try:
+        db = ChoreDB()
+        chore = db.add_chore(
+            name=name,
+            frequency_days=freq,
+            assigned_to=assigned,
+            duration_minutes=duration,
+            preferred_time_start=time_start,
+            preferred_time_end=time_end,
         )
     except Exception as exc:
         logger.error("Failed to add chore: %s", exc)
         await update.message.reply_text("Sorry, couldn't save the chore. Please try again.")
+        _clear_chore_data(context)
+        return ConversationHandler.END
 
+    # Create recurring calendar event
+    try:
+        created = await add_recurring_event(
+            summary=f"🧹 {name}",
+            description=f"Chore: {name}\nChore ID: {chore.id}",
+            start_date=slot["start_date"],
+            start_time=slot["start_time"],
+            end_time=slot["end_time"],
+            frequency_days=slot["frequency_days"],
+            occurrences=slot["occurrences"],
+        )
+        # Link the calendar event to the chore in DB
+        db.set_calendar_event_id(chore.id, created["id"])
+
+        times_pw = context.user_data.get("chore_times_per_week", "?")
+        link = created.get("htmlLink", "")
+        msg = (
+            f"✅ Chore *{name}* scheduled!\n"
+            f"• {times_pw}x per week, {slot['occurrences']} occurrences\n"
+            f"• Time: {slot['start_time']}–{slot['end_time']}\n"
+            f"• Starting: {slot['start_date']}"
+        )
+        if link:
+            msg += f"\n[Open in Google Calendar]({link})"
+        await update.message.reply_text(
+            msg, parse_mode="Markdown", reply_markup=ReplyKeyboardRemove(),
+        )
+    except CalendarError as exc:
+        logger.error("Calendar error: %s", exc)
+        await update.message.reply_text(
+            f"✅ Chore *{name}* saved to DB, but the calendar event "
+            f"couldn't be created. Error: {exc}",
+            parse_mode="Markdown",
+            reply_markup=ReplyKeyboardRemove(),
+        )
+
+    _clear_chore_data(context)
     return ConversationHandler.END
 
 
 async def addchore_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     """Cancel chore creation."""
-    context.user_data.pop("chore_name", None)
-    context.user_data.pop("chore_freq", None)
-    await update.message.reply_text("Chore creation cancelled.")
+    _clear_chore_data(context)
+    await update.message.reply_text(
+        "Chore creation cancelled.", reply_markup=ReplyKeyboardRemove(),
+    )
     return ConversationHandler.END
+
+
+def _clear_chore_data(context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Remove all chore-related keys from user_data."""
+    keys = [
+        "chore_name", "chore_freq", "chore_times_per_week", "chore_duration",
+        "chore_assigned", "chore_time_start", "chore_time_end",
+        "chore_weeks", "chore_slot",
+    ]
+    for k in keys:
+        context.user_data.pop(k, None)
 
 
 @authorized_only
@@ -376,6 +617,81 @@ async def cmd_done(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     except Exception as exc:
         logger.error("/done error: %s", exc)
         await update.message.reply_text(f"Couldn't mark chore {chore_id} as done. Please check the ID.")
+
+
+@authorized_only
+async def cmd_deletechore(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle /deletechore — show active chores as buttons to pick from."""
+    from src.data.db import ChoreDB
+
+    try:
+        db = ChoreDB()
+        chores = db.list_all(active_only=True)
+    except Exception as exc:
+        logger.error("/deletechore error: %s", exc)
+        await update.message.reply_text("Couldn't load chores. Please try again.")
+        return
+
+    if not chores:
+        await update.message.reply_text("No active chores to delete.")
+        return
+
+    keyboard = [
+        [InlineKeyboardButton(c.name, callback_data=f"delchore:{c.id}")]
+        for c in chores
+    ]
+    await update.message.reply_text(
+        "Which chore do you want to delete?",
+        reply_markup=InlineKeyboardMarkup(keyboard),
+    )
+
+
+async def _handle_deletechore_callback(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> None:
+    """Handle the inline button tap to delete a chore."""
+    from src.data.db import ChoreDB
+    from src.integrations.gcal_service import CalendarError, delete_event
+
+    query = update.callback_query
+    await query.answer()
+
+    # Verify the user is authorized
+    user = query.from_user
+    if user is None or user.id not in settings.ALLOWED_USER_IDS:
+        return
+
+    chore_id = int(query.data.split(":")[1])
+
+    try:
+        db = ChoreDB()
+        chore = db.get_chore(chore_id)
+        if chore is None or not chore.active:
+            await query.edit_message_text("Chore not found or already deleted.")
+            return
+
+        # Delete the recurring calendar event if linked
+        cal_deleted = False
+        if chore.calendar_event_id:
+            try:
+                await delete_event(chore.calendar_event_id)
+                cal_deleted = True
+            except CalendarError as exc:
+                logger.error("Failed to delete calendar event for chore #%d: %s", chore_id, exc)
+
+        # Soft-delete the chore in DB
+        db.delete_chore(chore_id)
+
+        msg = f"✅ Chore *{chore.name}* deleted."
+        if cal_deleted:
+            msg += "\nAll linked calendar events have been removed."
+        elif chore.calendar_event_id:
+            msg += "\n⚠️ Couldn't remove the calendar events — please delete them manually."
+        await query.edit_message_text(msg, parse_mode="Markdown")
+
+    except Exception as exc:
+        logger.error("deletechore callback error: %s", exc)
+        await query.edit_message_text("Something went wrong. Please try again.")
 
 
 # ---------------------------------------------------------------------------
@@ -446,14 +762,20 @@ def build_app() -> Application:
     app.add_handler(CommandHandler("today", cmd_today))
     app.add_handler(CommandHandler("chores", cmd_chores))
     app.add_handler(CommandHandler("done", cmd_done))
+    app.add_handler(CommandHandler("deletechore", cmd_deletechore))
+    app.add_handler(CallbackQueryHandler(_handle_deletechore_callback, pattern=r"^delchore:\d+$"))
 
     # /addchore conversation handler
+    _text = filters.TEXT & ~filters.COMMAND
     addchore_conv = ConversationHandler(
         entry_points=[CommandHandler("addchore", cmd_addchore)],
         states={
-            CHORE_NAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, addchore_name)],
-            CHORE_FREQ: [MessageHandler(filters.TEXT & ~filters.COMMAND, addchore_freq)],
-            CHORE_ASSIGNED: [MessageHandler(filters.TEXT & ~filters.COMMAND, addchore_assigned)],
+            CHORE_NAME: [MessageHandler(_text, addchore_name)],
+            CHORE_FREQ: [MessageHandler(_text, addchore_freq)],
+            CHORE_DURATION: [MessageHandler(_text, addchore_duration)],
+            CHORE_TIME_PREF: [MessageHandler(_text, addchore_time_pref)],
+            CHORE_WEEKS: [MessageHandler(_text, addchore_weeks)],
+            CHORE_CONFIRM: [MessageHandler(_text, addchore_confirm)],
         },
         fallbacks=[CommandHandler("cancel", addchore_cancel)],
     )

@@ -35,19 +35,43 @@ class ChoreDB:
         return conn
 
     def _init_db(self) -> None:
-        """Create the chores table if it doesn't exist."""
+        """Create the chores table if it doesn't exist, and migrate schema."""
         with self._connect() as conn:
             conn.execute("""
                 CREATE TABLE IF NOT EXISTS chores (
-                    id              INTEGER PRIMARY KEY AUTOINCREMENT,
-                    name            TEXT    NOT NULL,
-                    frequency_days  INTEGER NOT NULL,
-                    last_done       TEXT,
-                    next_due        TEXT    NOT NULL,
-                    assigned_to     TEXT    NOT NULL,
-                    active          INTEGER NOT NULL DEFAULT 1
+                    id                   INTEGER PRIMARY KEY AUTOINCREMENT,
+                    name                 TEXT    NOT NULL,
+                    frequency_days       INTEGER NOT NULL,
+                    duration_minutes     INTEGER NOT NULL DEFAULT 30,
+                    preferred_time_start TEXT    NOT NULL DEFAULT '09:00',
+                    preferred_time_end   TEXT    NOT NULL DEFAULT '21:00',
+                    last_done            TEXT,
+                    calendar_event_id    TEXT,
+                    next_due             TEXT    NOT NULL,
+                    assigned_to          TEXT    NOT NULL,
+                    active               INTEGER NOT NULL DEFAULT 1
                 )
             """)
+            # Migrate existing DBs: add new columns if missing
+            existing_cols = {
+                row[1] for row in conn.execute("PRAGMA table_info(chores)").fetchall()
+            }
+            if "duration_minutes" not in existing_cols:
+                conn.execute(
+                    "ALTER TABLE chores ADD COLUMN duration_minutes INTEGER NOT NULL DEFAULT 30"
+                )
+            if "preferred_time_start" not in existing_cols:
+                conn.execute(
+                    "ALTER TABLE chores ADD COLUMN preferred_time_start TEXT NOT NULL DEFAULT '09:00'"
+                )
+            if "preferred_time_end" not in existing_cols:
+                conn.execute(
+                    "ALTER TABLE chores ADD COLUMN preferred_time_end TEXT NOT NULL DEFAULT '21:00'"
+                )
+            if "calendar_event_id" not in existing_cols:
+                conn.execute(
+                    "ALTER TABLE chores ADD COLUMN calendar_event_id TEXT"
+                )
         logger.debug("Chores table initialized at %s", self._db_path)
 
     @staticmethod
@@ -56,7 +80,11 @@ class ChoreDB:
             id=row["id"],
             name=row["name"],
             frequency_days=row["frequency_days"],
+            duration_minutes=row["duration_minutes"],
+            preferred_time_start=row["preferred_time_start"],
+            preferred_time_end=row["preferred_time_end"],
             last_done=row["last_done"],
+            calendar_event_id=row["calendar_event_id"],
             next_due=row["next_due"],
             assigned_to=row["assigned_to"],
             active=bool(row["active"]),
@@ -67,6 +95,9 @@ class ChoreDB:
         name: str,
         frequency_days: int,
         assigned_to: str,
+        duration_minutes: int = 30,
+        preferred_time_start: str = "09:00",
+        preferred_time_end: str = "21:00",
         start_date: str | None = None,
     ) -> Chore:
         """Insert a new chore. next_due defaults to start_date (or today)."""
@@ -76,10 +107,17 @@ class ChoreDB:
         with self._connect() as conn:
             cursor = conn.execute(
                 """
-                INSERT INTO chores (name, frequency_days, last_done, next_due, assigned_to, active)
-                VALUES (?, ?, NULL, ?, ?, 1)
+                INSERT INTO chores
+                    (name, frequency_days, duration_minutes,
+                     preferred_time_start, preferred_time_end,
+                     last_done, next_due, assigned_to, active)
+                VALUES (?, ?, ?, ?, ?, NULL, ?, ?, 1)
                 """,
-                (name, frequency_days, start_date, assigned_to),
+                (
+                    name, frequency_days, duration_minutes,
+                    preferred_time_start, preferred_time_end,
+                    start_date, assigned_to,
+                ),
             )
             chore_id = cursor.lastrowid
 
@@ -87,6 +125,9 @@ class ChoreDB:
             id=chore_id,
             name=name,
             frequency_days=frequency_days,
+            duration_minutes=duration_minutes,
+            preferred_time_start=preferred_time_start,
+            preferred_time_end=preferred_time_end,
             last_done=None,
             next_due=start_date,
             assigned_to=assigned_to,
@@ -94,6 +135,25 @@ class ChoreDB:
         )
         logger.info("Chore added: #%d '%s' every %d days", chore_id, name, frequency_days)
         return chore
+
+    def set_calendar_event_id(self, chore_id: int, event_id: str) -> None:
+        """Link a chore to its Google Calendar recurring event."""
+        with self._connect() as conn:
+            conn.execute(
+                "UPDATE chores SET calendar_event_id = ? WHERE id = ?",
+                (event_id, chore_id),
+            )
+        logger.info("Chore #%d linked to calendar event %s", chore_id, event_id)
+
+    def get_chore(self, chore_id: int) -> Chore | None:
+        """Fetch a single chore by ID."""
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM chores WHERE id = ?", (chore_id,)
+            ).fetchone()
+        if row is None:
+            return None
+        return self._row_to_chore(row)
 
     def get_due_chores(self, target_date: str | None = None) -> list[Chore]:
         """Return all active chores where next_due <= target_date."""

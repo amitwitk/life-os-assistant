@@ -194,6 +194,77 @@ async def delete_event(event_id: str) -> None:
         raise CalendarError(f"Failed to delete event: {exc}") from exc
 
 
+async def add_recurring_event(
+    summary: str,
+    description: str,
+    start_date: str,
+    start_time: str,
+    end_time: str,
+    frequency_days: int,
+    occurrences: int,
+) -> dict:
+    """Create a single recurring Google Calendar event using RRULE.
+
+    This produces linked events in the Calendar UI — deleting one gives the
+    option to delete the entire series.
+
+    Args:
+        summary: Event title.
+        description: Event description.
+        start_date: First occurrence date (YYYY-MM-DD).
+        start_time: Start time (HH:MM).
+        end_time: End time (HH:MM).
+        frequency_days: Repeat every N days.
+        occurrences: Total number of occurrences.
+
+    Returns:
+        The created event dict (contains 'id', 'htmlLink', etc.).
+
+    Raises:
+        CalendarError: If the API call fails.
+    """
+    start_dt = datetime.strptime(f"{start_date} {start_time}", "%Y-%m-%d %H:%M")
+    end_dt = datetime.strptime(f"{start_date} {end_time}", "%Y-%m-%d %H:%M")
+
+    if frequency_days == 1:
+        rrule = f"RRULE:FREQ=DAILY;COUNT={occurrences}"
+    elif frequency_days == 7:
+        rrule = f"RRULE:FREQ=WEEKLY;COUNT={occurrences}"
+    else:
+        rrule = f"RRULE:FREQ=DAILY;INTERVAL={frequency_days};COUNT={occurrences}"
+
+    body = {
+        "summary": summary,
+        "description": description,
+        "start": {
+            "dateTime": start_dt.isoformat(),
+            "timeZone": TIMEZONE,
+        },
+        "end": {
+            "dateTime": end_dt.isoformat(),
+            "timeZone": TIMEZONE,
+        },
+        "recurrence": [rrule],
+    }
+
+    try:
+        service = get_calendar_service()
+        created = (
+            service.events()
+            .insert(calendarId="primary", body=body)
+            .execute()
+        )
+        logger.info(
+            "Recurring event created: '%s' starting %s %s–%s, every %d days, %d occurrences — %s",
+            summary, start_date, start_time, end_time,
+            frequency_days, occurrences, created.get("htmlLink", ""),
+        )
+        return created
+    except Exception as exc:
+        logger.error("Failed to create recurring event: %s", exc)
+        raise CalendarError(f"Failed to create recurring event: {exc}") from exc
+
+
 async def update_event(event_id: str, new_date: str, new_time: str) -> dict:
     """Update an existing Google Calendar event's date and time.
 
