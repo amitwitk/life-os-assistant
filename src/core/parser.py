@@ -77,7 +77,20 @@ class RescheduleEvent(BaseModel):
     new_time: str       # HH:MM in 24h format
 
 
-ParserResponse = ParsedEvent | CancelEvent | RescheduleEvent
+class QueryEvents(BaseModel):
+    """Structured query request to view events on a date.
+
+    JSON example:
+    {
+        "intent": "query",
+        "date": "2025-02-14"
+    }
+    """
+    intent: str = "query"
+    date: str  # ISO format YYYY-MM-DD
+
+
+ParserResponse = ParsedEvent | CancelEvent | RescheduleEvent | QueryEvents
 
 
 # ---------------------------------------------------------------------------
@@ -87,7 +100,7 @@ ParserResponse = ParsedEvent | CancelEvent | RescheduleEvent
 _SYSTEM_PROMPT = """\
 You are an event extraction engine for a personal assistant.
 Your job: parse the user's natural language message and extract calendar event details.
-The user can either CREATE a new event, CANCEL an existing one, or RESCHEDULE an existing one.
+The user can either CREATE a new event, CANCEL an existing one, RESCHEDULE an existing one, or QUERY their schedule.
 
 Today's date is {today}.
 
@@ -115,10 +128,17 @@ If the user's message contains keywords like "reschedule", "move", "change time"
 - "original_date" = the original date of the event.
 - "new_time" = the new time for the event in 24-hour format.
 
+**Function 4: Query Events**
+If the user's message is asking about their schedule, what meetings they have, what's planned, etc. — keywords like "what meetings", "what do I have", "show me", "מה יש לי", "מה התוכניות", use this JSON schema:
+{{"intent": "query", "date": "YYYY-MM-DD"}}
+
+- "date" = the date the user is asking about. Interpret relative dates relative to today.
+- If the user says "today", "this week", or doesn't specify a date, default to today's date.
+
 **General Rules:**
 - Support both Hebrew and English input.
 - Always return valid JSON matching one of the schemas above.
-- If the message does NOT contain any actionable event information (neither create, cancel, nor reschedule), return exactly: null
+- If the message does NOT contain any actionable event information (neither create, cancel, reschedule, nor query), return exactly: null
 - Return ONLY the JSON object (or null). No markdown, no explanation, no extra text.
 """
 
@@ -220,7 +240,7 @@ async def match_event(user_description: str, events: list[dict]) -> dict | None:
 async def parse_message(user_message: str) -> ParserResponse | None:
     """Parse a user message into a structured calendar event using the configured LLM.
 
-    Returns ParsedEvent, CancelEvent, RescheduleEvent, or None.
+    Returns ParsedEvent, CancelEvent, RescheduleEvent, QueryEvents, or None.
     """
     system_prompt = _SYSTEM_PROMPT.format(today=date.today().isoformat())
 
@@ -251,6 +271,10 @@ async def parse_message(user_message: str) -> ParserResponse | None:
         if intent == "reschedule":
             parsed = RescheduleEvent(**data)
             logger.info("Parsed event reschedule: %s on %s to %s", parsed.event_summary, parsed.original_date, parsed.new_time)
+            return parsed
+        if intent == "query":
+            parsed = QueryEvents(**data)
+            logger.info("Parsed event query for %s", parsed.date)
             return parsed
 
         _handle_unknown_intent(intent)
