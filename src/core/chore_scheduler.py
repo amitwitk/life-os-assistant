@@ -2,7 +2,7 @@
 LifeOS Assistant — Smart Chore Scheduler.
 
 Finds the best fixed time slot for a recurring chore, avoiding conflicts with
-existing Google Calendar events. Returns a single time to be used in a
+existing calendar events. Returns a single time to be used in a
 recurring calendar event (RRULE).
 """
 
@@ -10,11 +10,16 @@ from __future__ import annotations
 
 import logging
 from datetime import date, datetime, timedelta
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from src.ports.calendar_port import CalendarPort
 
 logger = logging.getLogger(__name__)
 
 
 async def find_best_slot(
+    calendar: CalendarPort,
     chore_name: str,
     frequency_days: int,
     duration_minutes: int,
@@ -29,6 +34,7 @@ async def find_best_slot(
     fixed time along with recurrence metadata.
 
     Args:
+        calendar: Calendar port for checking existing events.
         chore_name: Name of the chore (for logging).
         frequency_days: How often the chore repeats (in days).
         duration_minutes: How long the chore takes.
@@ -40,7 +46,6 @@ async def find_best_slot(
         Dict with keys: start_date, start_time, end_time, occurrences,
         frequency_days.  Or None if no slot can be found.
     """
-    from src.integrations.gcal_service import find_events
 
     tomorrow = date.today() + timedelta(days=1)
     end_date = tomorrow + timedelta(weeks=weeks_ahead)
@@ -80,7 +85,7 @@ async def find_best_slot(
     all_busy: list[list[tuple[int, int]]] = []
     for cd in sample_dates:
         try:
-            events = await find_events(target_date=cd.isoformat())
+            events = await calendar.find_events(target_date=cd.isoformat())
         except Exception as exc:
             logger.error("Failed to fetch events for %s: %s", cd, exc)
             events = []

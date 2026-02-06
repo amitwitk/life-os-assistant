@@ -87,10 +87,12 @@ def _make_update(text, user_id=12345, first_name="Amit"):
     return update
 
 
-def _make_context():
-    """Create a mock context with user_data dict."""
+def _make_context(calendar=None):
+    """Create a mock context with user_data dict and bot_data with calendar port."""
     context = MagicMock()
     context.user_data = {}
+    mock_cal = calendar or MagicMock()
+    context.bot_data = {"calendar": mock_cal}
     return context
 
 
@@ -225,8 +227,12 @@ class TestAddchoreConfirmHandler:
         from src.bot.telegram_bot import addchore_confirm
         from telegram.ext import ConversationHandler
 
+        mock_created = {"id": "gcal123", "htmlLink": "https://..."}
+        mock_cal = MagicMock()
+        mock_cal.add_recurring_event = AsyncMock(return_value=mock_created)
+
         update = _make_update("yes")
-        context = _make_context()
+        context = _make_context(calendar=mock_cal)
         context.user_data.update({
             "chore_name": "Test chore",
             "chore_freq": 7,
@@ -249,15 +255,13 @@ class TestAddchoreConfirmHandler:
         mock_db = MagicMock()
         mock_db.add_chore.return_value = mock_chore
 
-        mock_created = {"id": "gcal123", "htmlLink": "https://..."}
-
         with patch("src.data.db.ChoreDB", return_value=mock_db):
-            with patch("src.integrations.gcal_service.add_recurring_event", AsyncMock(return_value=mock_created)):
-                result = await addchore_confirm(update, context)
+            result = await addchore_confirm(update, context)
 
         assert result == ConversationHandler.END
         mock_db.add_chore.assert_called_once()
         mock_db.set_calendar_event_id.assert_called_once_with(1, "gcal123")
+        mock_cal.add_recurring_event.assert_called_once()
 
     @pytest.mark.asyncio
     async def test_confirm_no_cancels(self):

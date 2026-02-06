@@ -4,18 +4,22 @@ LifeOS Assistant — Morning Briefing Scheduler.
 The Morning Briefing pillar: a proactive daily push at 08:00 Asia/Jerusalem.
 The user starts their day with a friendly, LLM-written summary of
 today's calendar events and due chores — without needing to ask.
+
+This module is provider-agnostic: it depends on CalendarPort and
+NotificationPort protocols, not on specific implementations.
 """
 
 from __future__ import annotations
 
 import logging
-from datetime import time as dt_time
-from zoneinfo import ZoneInfo
-
-from telegram.ext import Application, ContextTypes
+from typing import TYPE_CHECKING
 
 from src.config import settings
 from src.core.llm import complete
+
+if TYPE_CHECKING:
+    from src.ports.calendar_port import CalendarPort
+    from src.ports.notification_port import NotificationPort
 
 logger = logging.getLogger(__name__)
 
@@ -25,36 +29,35 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 
 
-async def send_morning_summary(context: ContextTypes.DEFAULT_TYPE) -> None:
-    """JobQueue callback: send the morning briefing to all allowed users."""
-    bot = context.bot
-
+async def send_morning_summary(
+    calendar: CalendarPort,
+    notifier: NotificationPort,
+) -> None:
+    """Send the morning briefing to all allowed users via the notifier."""
     for chat_id in settings.ALLOWED_USER_IDS:
         try:
-            summary = await _build_morning_summary()
-            await bot.send_message(chat_id=chat_id, text=summary)
+            summary = await _build_morning_summary(calendar)
+            await notifier.send_message(chat_id, summary)
             logger.info("Morning briefing sent to user %d", chat_id)
         except Exception as exc:
             logger.error("Failed to send morning briefing to %d: %s", chat_id, exc)
 
 
-async def _build_morning_summary() -> str:
+async def _build_morning_summary(calendar: CalendarPort) -> str:
     """Gather calendar events + chores, then ask the LLM for a friendly summary.
 
     Graceful degradation:
-    - Calendar API fails → still include chores
-    - DB fails → still include calendar
-    - Both fail → fallback message
-    - LLM fails → raw text formatting
+    - Calendar API fails -> still include chores
+    - DB fails -> still include calendar
+    - Both fail -> fallback message
+    - LLM fails -> raw text formatting
     """
     events_text = ""
     chores_text = ""
 
     # 1. Calendar events
     try:
-        from src.integrations.gcal_service import get_daily_events
-
-        events = await get_daily_events()
+        events = await calendar.get_daily_events()
         if events:
             lines = []
             for ev in events:
@@ -90,7 +93,7 @@ async def _build_morning_summary() -> str:
 
     raw_data = f"{events_text}\n\n{chores_text}"
 
-    # 3. Both unavailable → fallback
+    # 3. Both unavailable -> fallback
     if "(unavailable)" in events_text and "(unavailable)" in chores_text:
         return (
             "בוקר טוב! ☀️\n\n"
@@ -116,27 +119,3 @@ async def _build_morning_summary() -> str:
         logger.warning("Morning briefing: LLM summarization failed: %s", exc)
         # Fallback: raw text
         return f"בוקר טוב! ☀️\n\n{raw_data}"
-
-
-# ---------------------------------------------------------------------------
-# Scheduler setup
-# ---------------------------------------------------------------------------
-
-
-def setup_scheduler(app: Application) -> None:
-    """Register the daily morning briefing job at 08:00 Asia/Jerusalem."""
-    tz = ZoneInfo(settings.TIMEZONE)
-    briefing_time = dt_time(hour=settings.MORNING_BRIEFING_HOUR, minute=0, tzinfo=tz)
-
-    job_queue = app.job_queue
-    job_queue.run_daily(
-        send_morning_summary,
-        time=briefing_time,
-        name="morning_briefing",
-    )
-
-    logger.info(
-        "Morning briefing scheduled at %02d:00 %s",
-        settings.MORNING_BRIEFING_HOUR,
-        settings.TIMEZONE,
-    )

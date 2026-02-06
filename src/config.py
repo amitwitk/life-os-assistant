@@ -33,9 +33,24 @@ class Settings(BaseModel):
     # Audio — OpenAI Whisper (transcription only)
     OPENAI_API_KEY: str = ""
 
-    # Google Calendar
+    # Calendar provider: "google" | "outlook" | "caldav"
+    CALENDAR_PROVIDER: str = "google"
+
+    # Google Calendar (only needed when CALENDAR_PROVIDER=google)
     GOOGLE_CREDENTIALS_PATH: str = "credentials.json"
     GOOGLE_TOKEN_PATH: str = "token.json"
+
+    # Microsoft Outlook/365 (only needed when CALENDAR_PROVIDER=outlook)
+    MS_CLIENT_ID: str = ""
+    MS_CLIENT_SECRET: str = ""
+    MS_TENANT_ID: str = "common"
+    MS_TOKEN_PATH: str = "ms_token.json"
+
+    # CalDAV (only needed when CALENDAR_PROVIDER=caldav)
+    CALDAV_URL: str = ""
+    CALDAV_USERNAME: str = ""
+    CALDAV_PASSWORD: str = ""
+    CALDAV_CALENDAR_NAME: str = ""
 
     # SQLite
     DATABASE_PATH: str = "data/chores.db"
@@ -81,8 +96,17 @@ def _load_settings() -> Settings:
         LLM_MODEL=os.getenv("LLM_MODEL", ""),
         LLM_API_KEY=llm_api_key,
         OPENAI_API_KEY=os.getenv("OPENAI_API_KEY", ""),
+        CALENDAR_PROVIDER=os.getenv("CALENDAR_PROVIDER", "google"),
         GOOGLE_CREDENTIALS_PATH=os.getenv("GOOGLE_CREDENTIALS_PATH", "credentials.json"),
         GOOGLE_TOKEN_PATH=os.getenv("GOOGLE_TOKEN_PATH", "token.json"),
+        MS_CLIENT_ID=os.getenv("MS_CLIENT_ID", ""),
+        MS_CLIENT_SECRET=os.getenv("MS_CLIENT_SECRET", ""),
+        MS_TENANT_ID=os.getenv("MS_TENANT_ID", "common"),
+        MS_TOKEN_PATH=os.getenv("MS_TOKEN_PATH", "ms_token.json"),
+        CALDAV_URL=os.getenv("CALDAV_URL", ""),
+        CALDAV_USERNAME=os.getenv("CALDAV_USERNAME", ""),
+        CALDAV_PASSWORD=os.getenv("CALDAV_PASSWORD", ""),
+        CALDAV_CALENDAR_NAME=os.getenv("CALDAV_CALENDAR_NAME", ""),
         DATABASE_PATH=os.getenv("DATABASE_PATH", "data/chores.db"),
         ALLOWED_USER_IDS=os.getenv("ALLOWED_USER_IDS", ""),
         MORNING_BRIEFING_HOUR=os.getenv("MORNING_BRIEFING_HOUR", "8"),
