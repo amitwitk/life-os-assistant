@@ -26,6 +26,3 @@ credentials.json
 
 # Claude Code
 .claude/
-
-# Local LLM abstraction files
-src/core/llm.py
