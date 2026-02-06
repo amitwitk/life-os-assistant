@@ -22,6 +22,10 @@ __pycache__/
 
 # Token files
 token.json
+credentials.json
 
 # Claude Code
 .claude/
+
+# Local LLM abstraction files
+src/core/llm.py

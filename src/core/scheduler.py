@@ -2,7 +2,7 @@
 LifeOS Assistant — Morning Briefing Scheduler.
 
 The Morning Briefing pillar: a proactive daily push at 08:00 Asia/Jerusalem.
-The user starts their day with a friendly, Claude-written summary of
+The user starts their day with a friendly, LLM-written summary of
 today's calendar events and due chores — without needing to ask.
 """
 
@@ -12,10 +12,10 @@ import logging
 from datetime import time as dt_time
 from zoneinfo import ZoneInfo
 
-import anthropic
 from telegram.ext import Application, ContextTypes
 
 from src.config import settings
+from src.core.llm import complete
 
 logger = logging.getLogger(__name__)
 
@@ -39,13 +39,13 @@ async def send_morning_summary(context: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 async def _build_morning_summary() -> str:
-    """Gather calendar events + chores, then ask Claude for a friendly summary.
+    """Gather calendar events + chores, then ask the LLM for a friendly summary.
 
     Graceful degradation:
     - Calendar API fails → still include chores
     - DB fails → still include calendar
     - Both fail → fallback message
-    - Claude fails → raw text formatting
+    - LLM fails → raw text formatting
     """
     events_text = ""
     chores_text = ""
@@ -98,12 +98,9 @@ async def _build_morning_summary() -> str:
             "נסה /today או /chores כדי לבדוק ידנית."
         )
 
-    # 4. Claude summarization
+    # 4. LLM summarization
     try:
-        client = anthropic.AsyncAnthropic(api_key=settings.ANTHROPIC_API_KEY)
-        response = await client.messages.create(
-            model="claude-haiku-4-5-20251001",
-            max_tokens=512,
+        summary = await complete(
             system=(
                 "You are a friendly personal assistant. "
                 "Summarize the following calendar events and chores into a warm, "
@@ -111,11 +108,12 @@ async def _build_morning_summary() -> str:
                 "If there are no events or chores, say so cheerfully. "
                 "Keep it under 300 words."
             ),
-            messages=[{"role": "user", "content": raw_data}],
+            user_message=raw_data,
+            max_tokens=512,
         )
-        return response.content[0].text.strip()
+        return summary.strip()
     except Exception as exc:
-        logger.warning("Morning briefing: Claude summarization failed: %s", exc)
+        logger.warning("Morning briefing: LLM summarization failed: %s", exc)
         # Fallback: raw text
         return f"בוקר טוב! ☀️\n\n{raw_data}"
 

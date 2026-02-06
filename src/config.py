@@ -25,8 +25,10 @@ class Settings(BaseModel):
     # Telegram
     TELEGRAM_BOT_TOKEN: str
 
-    # LLM — Anthropic Claude (parsing + summarization)
-    ANTHROPIC_API_KEY: str
+    # LLM — provider-agnostic (gemini, anthropic, openai)
+    LLM_PROVIDER: str = "gemini"
+    LLM_MODEL: str = ""          # empty → smart default per provider
+    LLM_API_KEY: str
 
     # Audio — OpenAI Whisper (transcription only)
     OPENAI_API_KEY: str = ""
@@ -63,19 +65,21 @@ class Settings(BaseModel):
 def _load_settings() -> Settings:
     """Load settings from environment, validating required keys."""
     token = os.getenv("TELEGRAM_BOT_TOKEN", "")
-    anthropic_key = os.getenv("ANTHROPIC_API_KEY", "")
+    llm_api_key = os.getenv("LLM_API_KEY", "")
 
     if not token or token.startswith("your-"):
         print("ERROR: TELEGRAM_BOT_TOKEN is missing or not set in .env", file=sys.stderr)
         sys.exit(1)
 
-    if not anthropic_key or anthropic_key.startswith("your-"):
-        print("ERROR: ANTHROPIC_API_KEY is missing or not set in .env", file=sys.stderr)
+    if not llm_api_key or llm_api_key.startswith("your-"):
+        print("ERROR: LLM_API_KEY is missing or not set in .env", file=sys.stderr)
         sys.exit(1)
 
     return Settings(
         TELEGRAM_BOT_TOKEN=token,
-        ANTHROPIC_API_KEY=anthropic_key,
+        LLM_PROVIDER=os.getenv("LLM_PROVIDER", "gemini"),
+        LLM_MODEL=os.getenv("LLM_MODEL", ""),
+        LLM_API_KEY=llm_api_key,
         OPENAI_API_KEY=os.getenv("OPENAI_API_KEY", ""),
         GOOGLE_CREDENTIALS_PATH=os.getenv("GOOGLE_CREDENTIALS_PATH", "credentials.json"),
         GOOGLE_TOKEN_PATH=os.getenv("GOOGLE_TOKEN_PATH", "token.json"),

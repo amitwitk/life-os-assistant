@@ -67,12 +67,13 @@ async def _process_text(
     text: str, update: Update, context: ContextTypes.DEFAULT_TYPE
 ) -> None:
     """Shared logic: parse text via LLM -> create or cancel Google Calendar event."""
-    from src.core.parser import CancelEvent, ParsedEvent, parse_message
+    from src.core.parser import CancelEvent, ParsedEvent, RescheduleEvent, match_event, parse_message
     from src.integrations.gcal_service import (
         CalendarError,
         add_event,
         delete_event,
         find_events,
+        update_event,
     )
 
     try:
@@ -87,8 +88,9 @@ async def _process_text(
     if parsed is None:
         await update.message.reply_text(
             "I couldn't find any actionable information in your message. "
-            "Try something like: 'Meeting with Dan tomorrow at 14:00' "
-            "or 'Cancel my meeting with Dan tomorrow'."
+            "Try something like: 'Meeting with Dan tomorrow at 14:00', "
+            "'Cancel my meeting with Dan tomorrow', or "
+            "'Reschedule my meeting with Dan tomorrow to 15:00'."
         )
         return
 
@@ -108,27 +110,65 @@ async def _process_text(
             )
     elif isinstance(parsed, CancelEvent):
         try:
-            events = await find_events(
-                query=parsed.event_summary, target_date=parsed.date
-            )
-            if not events:
+            all_events = await find_events(target_date=parsed.date)
+            if not all_events:
                 await update.message.reply_text(
-                    f"I couldn't find any event matching '{parsed.event_summary}' on {parsed.date}."
+                    f"There are no events on {parsed.date} to cancel."
                 )
                 return
 
-            # For now, just cancel the first match.
-            # A more advanced version could ask the user for clarification if multiple events match.
-            event_to_cancel = events[0]
-            await delete_event(event_to_cancel["id"])
+            matched = await match_event(parsed.event_summary, all_events)
+            if matched is None:
+                summaries = ", ".join(ev["summary"] for ev in all_events)
+                await update.message.reply_text(
+                    f"I couldn't match '{parsed.event_summary}' to any event on {parsed.date}.\n"
+                    f"Events that day: {summaries}"
+                )
+                return
+
+            await delete_event(matched["id"])
             await update.message.reply_text(
-                f"✅ Event canceled: *{event_to_cancel['summary']}*",
+                f"✅ Event canceled: *{matched['summary']}*",
                 parse_mode="Markdown",
             )
         except CalendarError as exc:
             logger.error("Calendar delete error: %s", exc)
             await update.message.reply_text(
                 "I found the event but couldn't cancel it. Please try again later."
+            )
+    elif isinstance(parsed, RescheduleEvent):
+        try:
+            all_events = await find_events(target_date=parsed.original_date)
+            if not all_events:
+                await update.message.reply_text(
+                    f"There are no events on {parsed.original_date} to reschedule."
+                )
+                return
+
+            matched = await match_event(parsed.event_summary, all_events)
+            if matched is None:
+                summaries = ", ".join(ev["summary"] for ev in all_events)
+                await update.message.reply_text(
+                    f"I couldn't match '{parsed.event_summary}' to any event on {parsed.original_date}.\n"
+                    f"Events that day: {summaries}"
+                )
+                return
+
+            updated = await update_event(
+                matched["id"], parsed.original_date, parsed.new_time
+            )
+            link = updated.get("htmlLink", "")
+            msg = (
+                f"✅ Event *{updated.get('summary', 'Unknown Event')}* "
+                f"rescheduled to {parsed.original_date} at {parsed.new_time}"
+            )
+            if link:
+                msg += f"\n[Open in Google Calendar]({link})"
+            await update.message.reply_text(msg, parse_mode="Markdown")
+        except CalendarError as exc:
+            logger.error("Calendar reschedule error: %s", exc)
+            await update.message.reply_text(
+                "I found the event but couldn't reschedule it. Please try again later."
             )
 
 
