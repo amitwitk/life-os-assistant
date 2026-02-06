@@ -4,6 +4,9 @@ LifeOS Assistant — Google Calendar Service.
 Write-side of the Capture System: takes a ParsedEvent from the LLM parser
 and creates the corresponding Google Calendar event.
 
+Read-side for the Morning Briefing: fetches today's events as structured data
+that the scheduler (4.2) passes to Claude for summarization.
+
 ParsedEvent JSON contract (defined in 1.2, consumed here and in 3.3):
 {
     "event": "Dentist appointment",
@@ -17,7 +20,7 @@ ParsedEvent JSON contract (defined in 1.2, consumed here and in 3.3):
 from __future__ import annotations
 
 import logging
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
 
 from src.core.parser import ParsedEvent
 from src.integrations.google_auth import get_calendar_service
@@ -77,3 +80,67 @@ async def add_event(parsed_event: ParsedEvent) -> dict:
     except Exception as exc:
         logger.error("Google Calendar API error: %s", exc)
         raise CalendarError(f"Failed to create event: {exc}") from exc
+
+
+# ---------------------------------------------------------------------------
+# Read-side: Morning Briefing
+# ---------------------------------------------------------------------------
+
+
+async def get_daily_events(target_date: str | None = None) -> list[dict]:
+    """Fetch all calendar events for a given date.
+
+    Args:
+        target_date: Date in YYYY-MM-DD format. Defaults to today.
+
+    Returns:
+        List of simplified event dicts with keys:
+        id, summary, start_time, end_time, description.
+
+        This structured output is consumed by 4.2_Scheduler,
+        which passes it to Claude for summarization.
+
+    Raises:
+        CalendarError: If the Google Calendar API call fails.
+    """
+    if target_date is None:
+        target_date = date.today().isoformat()
+
+    # Build time range: full day in Asia/Jerusalem
+    time_min = f"{target_date}T00:00:00+03:00"
+    time_max = f"{target_date}T23:59:59+03:00"
+
+    try:
+        service = get_calendar_service()
+        result = (
+            service.events()
+            .list(
+                calendarId="primary",
+                timeMin=time_min,
+                timeMax=time_max,
+                singleEvents=True,
+                orderBy="startTime",
+            )
+            .execute()
+        )
+
+        events = []
+        for item in result.get("items", []):
+            start = item.get("start", {})
+            end = item.get("end", {})
+            events.append(
+                {
+                    "id": item.get("id", ""),
+                    "summary": item.get("summary", "(no title)"),
+                    "start_time": start.get("dateTime", start.get("date", "")),
+                    "end_time": end.get("dateTime", end.get("date", "")),
+                    "description": item.get("description", ""),
+                }
+            )
+
+        logger.info("Fetched %d event(s) for %s", len(events), target_date)
+        return events
+
+    except Exception as exc:
+        logger.error("Failed to fetch events for %s: %s", target_date, exc)
+        raise CalendarError(f"Failed to fetch events: {exc}") from exc
