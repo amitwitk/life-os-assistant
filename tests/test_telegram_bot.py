@@ -394,3 +394,345 @@ class TestDeleteChoreFlow:
         with patch("src.data.db.ChoreDB", return_value=mock_db):
             await cmd_deletechore(update, context)
         update.message.reply_text.assert_called_with("No active chores to delete.")
+
+
+# ---------------------------------------------------------------------------
+# Tests for conflict resolution flow
+# ---------------------------------------------------------------------------
+
+
+class TestConflictResolutionCreate:
+    """Test conflict detection when creating events via _process_text."""
+
+    @pytest.mark.asyncio
+    async def test_create_no_conflict_proceeds(self):
+        """When no conflict, event is created normally."""
+        from src.bot.telegram_bot import _process_text
+        from src.core.parser import ParsedEvent
+        from src.core.conflict_checker import ConflictResult
+
+        mock_cal = MagicMock()
+        mock_cal.add_event = AsyncMock(return_value={"htmlLink": "https://cal/1"})
+
+        update = _make_update("Meeting tomorrow at 14:00")
+        context = _make_context(calendar=mock_cal)
+
+        parsed = ParsedEvent(event="Meeting", date="2026-02-08", time="14:00")
+        no_conflict = ConflictResult(has_conflict=False)
+
+        with patch("src.core.parser.parse_message", AsyncMock(return_value=parsed)), \
+             patch("src.core.conflict_checker.check_conflict", AsyncMock(return_value=no_conflict)):
+            await _process_text("Meeting tomorrow at 14:00", update, context)
+
+        mock_cal.add_event.assert_called_once()
+        assert "pending_event" not in context.user_data
+
+    @pytest.mark.asyncio
+    async def test_create_with_conflict_shows_keyboard(self):
+        """When conflict detected, shows inline keyboard instead of creating."""
+        from src.bot.telegram_bot import _process_text
+        from src.core.parser import ParsedEvent
+        from src.core.conflict_checker import ConflictResult
+
+        mock_cal = MagicMock()
+        mock_cal.add_event = AsyncMock()
+
+        update = _make_update("Meeting at 14:00")
+        context = _make_context(calendar=mock_cal)
+
+        parsed = ParsedEvent(event="Meeting", date="2026-02-08", time="14:00")
+        conflict = ConflictResult(
+            has_conflict=True,
+            conflicting_events=[{"summary": "Existing meeting", "start_time": "14:00", "end_time": "15:00"}],
+            suggested_time="15:00",
+        )
+
+        with patch("src.core.parser.parse_message", AsyncMock(return_value=parsed)), \
+             patch("src.core.conflict_checker.check_conflict", AsyncMock(return_value=conflict)):
+            await _process_text("Meeting at 14:00", update, context)
+
+        # Event should NOT have been created
+        mock_cal.add_event.assert_not_called()
+        # Pending event should be stored
+        assert "pending_event" in context.user_data
+        assert context.user_data["pending_event"]["type"] == "create"
+        # Reply should contain conflict info and inline keyboard
+        reply_call = update.message.reply_text.call_args
+        assert "conflict" in reply_call[0][0].lower()
+        assert reply_call[1]["reply_markup"] is not None
+
+
+class TestConflictResolutionReschedule:
+    """Test conflict detection when rescheduling events."""
+
+    @pytest.mark.asyncio
+    async def test_reschedule_with_conflict_shows_keyboard(self):
+        from src.bot.telegram_bot import _process_text
+        from src.core.parser import RescheduleEvent
+        from src.core.conflict_checker import ConflictResult
+
+        matched_event = {
+            "id": "ev1", "summary": "My Meeting",
+            "start_time": "10:00", "end_time": "11:00",
+        }
+        mock_cal = MagicMock()
+        mock_cal.find_events = AsyncMock(return_value=[matched_event])
+        mock_cal.update_event = AsyncMock()
+
+        update = _make_update("Reschedule meeting to 14:00")
+        context = _make_context(calendar=mock_cal)
+
+        parsed = RescheduleEvent(
+            event_summary="My Meeting",
+            original_date="2026-02-08",
+            new_time="14:00",
+        )
+        conflict = ConflictResult(
+            has_conflict=True,
+            conflicting_events=[{"summary": "Blocker", "start_time": "14:00", "end_time": "15:00"}],
+            suggested_time="15:00",
+        )
+
+        with patch("src.core.parser.parse_message", AsyncMock(return_value=parsed)), \
+             patch("src.core.parser.match_event", AsyncMock(return_value=matched_event)), \
+             patch("src.core.conflict_checker.check_conflict", AsyncMock(return_value=conflict)):
+            await _process_text("Reschedule meeting to 14:00", update, context)
+
+        mock_cal.update_event.assert_not_called()
+        assert context.user_data["pending_event"]["type"] == "reschedule"
+        assert context.user_data["pending_event"]["event_id"] == "ev1"
+
+    @pytest.mark.asyncio
+    async def test_reschedule_self_exclusion_no_conflict(self):
+        """When rescheduling to same time, self-exclusion means no conflict."""
+        from src.bot.telegram_bot import _process_text
+        from src.core.parser import RescheduleEvent
+        from src.core.conflict_checker import ConflictResult
+
+        matched_event = {
+            "id": "ev1", "summary": "My Meeting",
+            "start_time": "10:00", "end_time": "11:00",
+        }
+        mock_cal = MagicMock()
+        mock_cal.find_events = AsyncMock(return_value=[matched_event])
+        mock_cal.update_event = AsyncMock(return_value={
+            "summary": "My Meeting", "htmlLink": "https://cal/1",
+        })
+
+        update = _make_update("Reschedule meeting to 15:00")
+        context = _make_context(calendar=mock_cal)
+
+        parsed = RescheduleEvent(
+            event_summary="My Meeting",
+            original_date="2026-02-08",
+            new_time="15:00",
+        )
+        no_conflict = ConflictResult(has_conflict=False)
+
+        with patch("src.core.parser.parse_message", AsyncMock(return_value=parsed)), \
+             patch("src.core.parser.match_event", AsyncMock(return_value=matched_event)), \
+             patch("src.core.conflict_checker.check_conflict", AsyncMock(return_value=no_conflict)):
+            await _process_text("Reschedule meeting to 15:00", update, context)
+
+        mock_cal.update_event.assert_called_once()
+
+
+class TestConflictCallbackHandler:
+    """Test the inline keyboard callback for conflict resolution."""
+
+    def _make_callback_update(self, callback_data, user_id=12345, button_text="Use 15:00"):
+        """Create a mock Update with a callback query."""
+        update = MagicMock()
+        update.callback_query.data = callback_data
+        update.callback_query.from_user.id = user_id
+        update.callback_query.answer = AsyncMock()
+        update.callback_query.edit_message_text = AsyncMock()
+        # Mock the reply_markup to contain the suggested time button
+        btn = MagicMock()
+        btn.callback_data = "conflict:suggested"
+        btn.text = button_text
+        update.callback_query.message.reply_markup.inline_keyboard = [[btn]]
+        return update
+
+    @pytest.mark.asyncio
+    async def test_callback_suggested(self):
+        from src.bot.telegram_bot import _handle_conflict_callback
+        from src.core.parser import ParsedEvent
+
+        parsed = ParsedEvent(event="Meeting", date="2026-02-08", time="14:00")
+        mock_cal = MagicMock()
+        mock_cal.add_event = AsyncMock(return_value={"htmlLink": ""})
+
+        update = self._make_callback_update("conflict:suggested")
+        context = _make_context(calendar=mock_cal)
+        context.user_data["pending_event"] = {"type": "create", "parsed": parsed}
+
+        await _handle_conflict_callback(update, context)
+
+        mock_cal.add_event.assert_called_once()
+        assert parsed.time == "15:00"  # Updated to suggested time
+        assert "pending_event" not in context.user_data
+
+    @pytest.mark.asyncio
+    async def test_callback_force(self):
+        from src.bot.telegram_bot import _handle_conflict_callback
+        from src.core.parser import ParsedEvent
+
+        parsed = ParsedEvent(event="Meeting", date="2026-02-08", time="14:00")
+        mock_cal = MagicMock()
+        mock_cal.add_event = AsyncMock(return_value={"htmlLink": ""})
+
+        update = self._make_callback_update("conflict:force")
+        context = _make_context(calendar=mock_cal)
+        context.user_data["pending_event"] = {"type": "create", "parsed": parsed}
+
+        await _handle_conflict_callback(update, context)
+
+        mock_cal.add_event.assert_called_once()
+        assert parsed.time == "14:00"  # Kept original time
+        assert "pending_event" not in context.user_data
+
+    @pytest.mark.asyncio
+    async def test_callback_custom_prompts_user(self):
+        from src.bot.telegram_bot import _handle_conflict_callback
+        from src.core.parser import ParsedEvent
+
+        parsed = ParsedEvent(event="Meeting", date="2026-02-08", time="14:00")
+
+        update = self._make_callback_update("conflict:custom")
+        context = _make_context()
+        context.user_data["pending_event"] = {"type": "create", "parsed": parsed}
+
+        await _handle_conflict_callback(update, context)
+
+        assert context.user_data.get("awaiting_custom_time") is True
+        update.callback_query.edit_message_text.assert_called_once()
+        assert "HH:MM" in update.callback_query.edit_message_text.call_args[0][0]
+
+    @pytest.mark.asyncio
+    async def test_callback_cancel(self):
+        from src.bot.telegram_bot import _handle_conflict_callback
+        from src.core.parser import ParsedEvent
+
+        parsed = ParsedEvent(event="Meeting", date="2026-02-08", time="14:00")
+
+        update = self._make_callback_update("conflict:cancel")
+        context = _make_context()
+        context.user_data["pending_event"] = {"type": "create", "parsed": parsed}
+
+        await _handle_conflict_callback(update, context)
+
+        assert "pending_event" not in context.user_data
+        update.callback_query.edit_message_text.assert_called_with("Event creation cancelled.")
+
+    @pytest.mark.asyncio
+    async def test_callback_no_pending_event(self):
+        from src.bot.telegram_bot import _handle_conflict_callback
+
+        update = self._make_callback_update("conflict:force")
+        context = _make_context()
+        # No pending_event set
+
+        await _handle_conflict_callback(update, context)
+
+        update.callback_query.edit_message_text.assert_called_with(
+            "No pending event found. Please try again."
+        )
+
+    @pytest.mark.asyncio
+    async def test_callback_reschedule_force(self):
+        from src.bot.telegram_bot import _handle_conflict_callback
+
+        mock_cal = MagicMock()
+        mock_cal.update_event = AsyncMock(return_value={
+            "summary": "My Meeting", "htmlLink": "",
+        })
+
+        update = self._make_callback_update("conflict:force")
+        context = _make_context(calendar=mock_cal)
+        context.user_data["pending_event"] = {
+            "type": "reschedule",
+            "event_id": "ev1",
+            "date": "2026-02-08",
+            "time": "14:00",
+            "duration": 60,
+            "summary": "My Meeting",
+        }
+
+        await _handle_conflict_callback(update, context)
+
+        mock_cal.update_event.assert_called_once_with("ev1", "2026-02-08", "14:00")
+        assert "pending_event" not in context.user_data
+
+
+class TestCustomTimeHandler:
+    """Test the custom time input during conflict resolution."""
+
+    @pytest.mark.asyncio
+    async def test_valid_custom_time_creates_event(self):
+        from src.bot.telegram_bot import _process_text
+        from src.core.parser import ParsedEvent
+        from src.core.conflict_checker import ConflictResult
+
+        parsed = ParsedEvent(event="Meeting", date="2026-02-08", time="14:00")
+        mock_cal = MagicMock()
+        mock_cal.add_event = AsyncMock(return_value={"htmlLink": ""})
+
+        update = _make_update("16:30")
+        context = _make_context(calendar=mock_cal)
+        context.user_data["awaiting_custom_time"] = True
+        context.user_data["pending_event"] = {"type": "create", "parsed": parsed}
+
+        no_conflict = ConflictResult(has_conflict=False)
+        with patch("src.core.conflict_checker.check_conflict", AsyncMock(return_value=no_conflict)):
+            await _process_text("16:30", update, context)
+
+        mock_cal.add_event.assert_called_once()
+        assert parsed.time == "16:30"
+        assert "pending_event" not in context.user_data
+        assert "awaiting_custom_time" not in context.user_data
+
+    @pytest.mark.asyncio
+    async def test_invalid_format_cancels(self):
+        from src.bot.telegram_bot import _process_text
+        from src.core.parser import ParsedEvent
+
+        parsed = ParsedEvent(event="Meeting", date="2026-02-08", time="14:00")
+
+        update = _make_update("not-a-time")
+        context = _make_context()
+        context.user_data["awaiting_custom_time"] = True
+        context.user_data["pending_event"] = {"type": "create", "parsed": parsed}
+
+        await _process_text("not-a-time", update, context)
+
+        assert "pending_event" not in context.user_data
+        assert "Invalid time" in update.message.reply_text.call_args[0][0]
+
+    @pytest.mark.asyncio
+    async def test_custom_time_with_still_conflicting_warns_and_proceeds(self):
+        from src.bot.telegram_bot import _process_text
+        from src.core.parser import ParsedEvent
+        from src.core.conflict_checker import ConflictResult
+
+        parsed = ParsedEvent(event="Meeting", date="2026-02-08", time="14:00")
+        mock_cal = MagicMock()
+        mock_cal.add_event = AsyncMock(return_value={"htmlLink": ""})
+
+        update = _make_update("15:00")
+        context = _make_context(calendar=mock_cal)
+        context.user_data["awaiting_custom_time"] = True
+        context.user_data["pending_event"] = {"type": "create", "parsed": parsed}
+
+        still_conflict = ConflictResult(
+            has_conflict=True,
+            conflicting_events=[{"summary": "Another meeting"}],
+        )
+        with patch("src.core.conflict_checker.check_conflict", AsyncMock(return_value=still_conflict)):
+            await _process_text("15:00", update, context)
+
+        # Should still create the event (warns but proceeds)
+        mock_cal.add_event.assert_called_once()
+        # First call is the warning, second is the success message
+        calls = update.message.reply_text.call_args_list
+        assert any("also conflicts" in str(c) for c in calls)

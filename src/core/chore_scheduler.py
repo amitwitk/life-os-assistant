@@ -132,7 +132,7 @@ async def find_best_slot(
     return result
 
 
-def _time_str_to_minutes(time_str: str) -> int | None:
+def time_str_to_minutes(time_str: str) -> int | None:
     """Convert an ISO datetime or HH:MM string to minutes from midnight."""
     if not time_str:
         return None
@@ -146,7 +146,7 @@ def _time_str_to_minutes(time_str: str) -> int | None:
         return None
 
 
-def _overlaps_any(
+def overlaps_any(
     start: int, end: int, busy: list[tuple[int, int]]
 ) -> bool:
     """Check if [start, end) overlaps with any busy interval."""
@@ -154,3 +154,8 @@ def _overlaps_any(
         if start < be and end > bs:
             return True
     return False
+
+
+# Back-compat aliases
+_time_str_to_minutes = time_str_to_minutes
+_overlaps_any = overlaps_any

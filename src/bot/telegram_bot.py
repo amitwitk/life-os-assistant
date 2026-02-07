@@ -75,7 +75,13 @@ async def _process_text(
     text: str, update: Update, context: ContextTypes.DEFAULT_TYPE
 ) -> None:
     """Shared logic: parse text via LLM -> create or cancel calendar event."""
+    from src.core.conflict_checker import check_conflict, extract_event_duration_minutes
     from src.core.parser import CancelEvent, ParsedEvent, QueryEvents, RescheduleEvent, match_event, parse_message
+
+    # Intercept custom time input if awaiting one
+    if context.user_data.get("awaiting_custom_time"):
+        await _handle_custom_time(text, update, context)
+        return
 
     calendar: CalendarPort = context.bot_data["calendar"]
 
@@ -98,6 +104,18 @@ async def _process_text(
         return
 
     if isinstance(parsed, ParsedEvent):
+        # Check for conflicts before creating
+        conflict = await check_conflict(
+            calendar, parsed.date, parsed.time, parsed.duration_minutes,
+        )
+        if conflict.has_conflict:
+            context.user_data["pending_event"] = {
+                "type": "create",
+                "parsed": parsed,
+            }
+            await _send_conflict_message(update, conflict, parsed.time)
+            return
+
         try:
             created = await calendar.add_event(parsed)
             link = created.get("htmlLink", "")
@@ -157,6 +175,24 @@ async def _process_text(
                 )
                 return
 
+            # Check for conflicts at the new time (exclude the event being rescheduled)
+            duration = extract_event_duration_minutes(matched)
+            conflict = await check_conflict(
+                calendar, parsed.original_date, parsed.new_time,
+                duration, exclude_event_id=matched["id"],
+            )
+            if conflict.has_conflict:
+                context.user_data["pending_event"] = {
+                    "type": "reschedule",
+                    "event_id": matched["id"],
+                    "date": parsed.original_date,
+                    "time": parsed.new_time,
+                    "duration": duration,
+                    "summary": matched.get("summary", "Unknown Event"),
+                }
+                await _send_conflict_message(update, conflict, parsed.new_time)
+                return
+
             updated = await calendar.update_event(
                 matched["id"], parsed.original_date, parsed.new_time
             )
@@ -197,6 +233,224 @@ async def _process_text(
             await update.message.reply_text(
                 "Couldn't fetch events. Please try again later."
             )
+
+
+# ---------------------------------------------------------------------------
+# Conflict resolution helpers
+# ---------------------------------------------------------------------------
+
+
+async def _send_conflict_message(
+    update: Update,
+    conflict: "ConflictResult",
+    original_time: str,
+) -> None:
+    """Send a conflict notification with resolution options."""
+    from src.core.conflict_checker import ConflictResult
+
+    clashing = ", ".join(
+        ev.get("summary", "(no title)") for ev in conflict.conflicting_events
+    )
+    msg = (
+        f"⚠️ *Time conflict detected!*\n"
+        f"Your requested time ({original_time}) overlaps with: {clashing}"
+    )
+
+    buttons = []
+    if conflict.suggested_time:
+        buttons.append([InlineKeyboardButton(
+            f"Use {conflict.suggested_time}", callback_data="conflict:suggested",
+        )])
+    buttons.append([InlineKeyboardButton(
+        f"Force {original_time}", callback_data="conflict:force",
+    )])
+    buttons.append([InlineKeyboardButton(
+        "Enter custom time", callback_data="conflict:custom",
+    )])
+    buttons.append([InlineKeyboardButton(
+        "Cancel", callback_data="conflict:cancel",
+    )])
+
+    await update.message.reply_text(
+        msg, parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(buttons),
+    )
+
+
+async def _handle_conflict_callback(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> None:
+    """Handle inline keyboard taps for conflict resolution."""
+    from src.core.conflict_checker import ConflictResult
+
+    query = update.callback_query
+    await query.answer()
+
+    user = query.from_user
+    if user is None or user.id not in settings.ALLOWED_USER_IDS:
+        return
+
+    pending = context.user_data.get("pending_event")
+    if not pending:
+        await query.edit_message_text("No pending event found. Please try again.")
+        return
+
+    action = query.data.split(":")[1]
+
+    if action == "cancel":
+        context.user_data.pop("pending_event", None)
+        await query.edit_message_text("Event creation cancelled.")
+        return
+
+    if action == "custom":
+        context.user_data["awaiting_custom_time"] = True
+        await query.edit_message_text(
+            "Please type the time you want (HH:MM format, e.g. 15:30):"
+        )
+        return
+
+    calendar: CalendarPort = context.bot_data["calendar"]
+
+    if action == "suggested":
+        # Use the suggested time from the conflict result
+        # Re-read the suggested time from the keyboard button text
+        suggested_time = None
+        if query.message and query.message.reply_markup:
+            for row in query.message.reply_markup.inline_keyboard:
+                for btn in row:
+                    if btn.callback_data == "conflict:suggested":
+                        # Extract HH:MM from button text like "Use 15:30"
+                        suggested_time = btn.text.replace("Use ", "")
+                        break
+        if not suggested_time:
+            await query.edit_message_text("Could not determine suggested time. Please try again.")
+            context.user_data.pop("pending_event", None)
+            return
+        time_to_use = suggested_time
+    elif action == "force":
+        if pending["type"] == "create":
+            time_to_use = pending["parsed"].time
+        else:
+            time_to_use = pending["time"]
+    else:
+        context.user_data.pop("pending_event", None)
+        return
+
+    await _execute_pending_event(pending, time_to_use, calendar, query)
+    context.user_data.pop("pending_event", None)
+
+
+async def _execute_pending_event(
+    pending: dict, time_to_use: str, calendar: "CalendarPort", query: Any,
+) -> None:
+    """Execute the pending event creation or reschedule at the given time."""
+    try:
+        if pending["type"] == "create":
+            parsed = pending["parsed"]
+            parsed.time = time_to_use
+            created = await calendar.add_event(parsed)
+            link = created.get("htmlLink", "")
+            msg = f"✅ Event created: *{parsed.event}* on {parsed.date} at {time_to_use}"
+            if link:
+                msg += f"\n[Open in Google Calendar]({link})"
+            await query.edit_message_text(msg, parse_mode="Markdown")
+        else:
+            updated = await calendar.update_event(
+                pending["event_id"], pending["date"], time_to_use,
+            )
+            link = updated.get("htmlLink", "")
+            summary = updated.get("summary", pending.get("summary", "Unknown Event"))
+            msg = f"✅ Event *{summary}* rescheduled to {pending['date']} at {time_to_use}"
+            if link:
+                msg += f"\n[Open in Google Calendar]({link})"
+            await query.edit_message_text(msg, parse_mode="Markdown")
+    except CalendarError as exc:
+        logger.error("Calendar error during conflict resolution: %s", exc)
+        await query.edit_message_text(
+            "Something went wrong while saving the event. Please try again."
+        )
+
+
+async def _handle_custom_time(
+    text: str, update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> None:
+    """Handle user-typed custom time during conflict resolution."""
+    import re
+
+    context.user_data.pop("awaiting_custom_time", None)
+
+    pending = context.user_data.get("pending_event")
+    if not pending:
+        await update.message.reply_text("No pending event. Please start over.")
+        return
+
+    text = text.strip()
+    if not re.match(r"^\d{1,2}:\d{2}$", text):
+        context.user_data.pop("pending_event", None)
+        await update.message.reply_text(
+            "Invalid time format. Please use HH:MM (e.g. 15:30). Event cancelled."
+        )
+        return
+
+    calendar: CalendarPort = context.bot_data["calendar"]
+
+    # Re-check conflict at the custom time (warn but proceed)
+    from src.core.conflict_checker import check_conflict
+
+    if pending["type"] == "create":
+        parsed = pending["parsed"]
+        conflict = await check_conflict(
+            calendar, parsed.date, text, parsed.duration_minutes,
+        )
+        if conflict.has_conflict:
+            clashing = ", ".join(
+                ev.get("summary", "(no title)") for ev in conflict.conflicting_events
+            )
+            await update.message.reply_text(
+                f"⚠️ Note: {text} also conflicts with: {clashing}. Proceeding anyway."
+            )
+        parsed.time = text
+        try:
+            created = await calendar.add_event(parsed)
+            link = created.get("htmlLink", "")
+            msg = f"✅ Event created: *{parsed.event}* on {parsed.date} at {text}"
+            if link:
+                msg += f"\n[Open in Google Calendar]({link})"
+            await update.message.reply_text(msg, parse_mode="Markdown")
+        except CalendarError as exc:
+            logger.error("Calendar error during custom time: %s", exc)
+            await update.message.reply_text(
+                "Couldn't save the event. Please try again later."
+            )
+    else:
+        exclude_id = pending.get("event_id")
+        conflict = await check_conflict(
+            calendar, pending["date"], text,
+            pending["duration"], exclude_event_id=exclude_id,
+        )
+        if conflict.has_conflict:
+            clashing = ", ".join(
+                ev.get("summary", "(no title)") for ev in conflict.conflicting_events
+            )
+            await update.message.reply_text(
+                f"⚠️ Note: {text} also conflicts with: {clashing}. Proceeding anyway."
+            )
+        try:
+            updated = await calendar.update_event(
+                pending["event_id"], pending["date"], text,
+            )
+            link = updated.get("htmlLink", "")
+            summary = updated.get("summary", pending.get("summary", "Unknown Event"))
+            msg = f"✅ Event *{summary}* rescheduled to {pending['date']} at {text}"
+            if link:
+                msg += f"\n[Open in Google Calendar]({link})"
+            await update.message.reply_text(msg, parse_mode="Markdown")
+        except CalendarError as exc:
+            logger.error("Calendar error during custom time reschedule: %s", exc)
+            await update.message.reply_text(
+                "Couldn't reschedule the event. Please try again later."
+            )
+
+    context.user_data.pop("pending_event", None)
 
 
 # ---------------------------------------------------------------------------
@@ -793,6 +1047,7 @@ def build_app(
     app.add_handler(CommandHandler("done", cmd_done))
     app.add_handler(CommandHandler("deletechore", cmd_deletechore))
     app.add_handler(CallbackQueryHandler(_handle_deletechore_callback, pattern=r"^delchore:\d+$"))
+    app.add_handler(CallbackQueryHandler(_handle_conflict_callback, pattern=r"^conflict:"))
 
     # /addchore conversation handler
     _text = filters.TEXT & ~filters.COMMAND
