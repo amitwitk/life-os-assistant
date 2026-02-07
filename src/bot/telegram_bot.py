@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import logging
 import tempfile
+from dataclasses import dataclass, field
 from datetime import time as dt_time
 from functools import wraps
 from pathlib import Path
@@ -67,6 +68,20 @@ def authorized_only(
 
 
 # ---------------------------------------------------------------------------
+# Batch action result
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class ActionResult:
+    """Result of a single action within a batch."""
+    action_type: str     # "create" | "cancel" | "reschedule" | "query" | "cancel_all_except"
+    summary: str         # human-readable description
+    success: bool
+    error_message: str = ""
+
+
+# ---------------------------------------------------------------------------
 # Capture System: parse text → create calendar event
 # ---------------------------------------------------------------------------
 
@@ -74,19 +89,16 @@ def authorized_only(
 async def _process_text(
     text: str, update: Update, context: ContextTypes.DEFAULT_TYPE
 ) -> None:
-    """Shared logic: parse text via LLM -> create or cancel calendar event."""
-    from src.core.conflict_checker import check_conflict, extract_event_duration_minutes
-    from src.core.parser import CancelEvent, ParsedEvent, QueryEvents, RescheduleEvent, match_event, parse_message
+    """Shared logic: parse text via LLM -> execute calendar actions."""
+    from src.core.parser import parse_message
 
     # Intercept custom time input if awaiting one
     if context.user_data.get("awaiting_custom_time"):
         await _handle_custom_time(text, update, context)
         return
 
-    calendar: CalendarPort = context.bot_data["calendar"]
-
     try:
-        parsed = await parse_message(text)
+        actions = await parse_message(text)
     except Exception as exc:
         logger.error("Parser error: %s", exc)
         await update.message.reply_text(
@@ -94,7 +106,7 @@ async def _process_text(
         )
         return
 
-    if parsed is None:
+    if not actions:
         await update.message.reply_text(
             "I couldn't find any actionable information in your message. "
             "Try something like: 'Meeting with Dan tomorrow at 14:00', "
@@ -103,8 +115,33 @@ async def _process_text(
         )
         return
 
+    if len(actions) == 1:
+        await _execute_single_action(actions[0], update, context)
+        return
+
+    # Multi-action: process all, collect results, send summary
+    results = await _execute_batch_actions(actions, update, context)
+    await _send_batch_summary(results, update)
+
+
+# ---------------------------------------------------------------------------
+# Single-action execution (full interactive flow with conflict keyboard)
+# ---------------------------------------------------------------------------
+
+
+async def _execute_single_action(
+    parsed: "ParserResponse", update: Update, context: ContextTypes.DEFAULT_TYPE,
+) -> None:
+    """Execute a single parsed action with full interactive flow (conflict keyboard, etc.)."""
+    from src.core.conflict_checker import check_conflict, extract_event_duration_minutes
+    from src.core.parser import (
+        CancelAllExcept, CancelEvent, ParsedEvent, QueryEvents, RescheduleEvent,
+        batch_exclude_events, match_event,
+    )
+
+    calendar: CalendarPort = context.bot_data["calendar"]
+
     if isinstance(parsed, ParsedEvent):
-        # Check for conflicts before creating
         conflict = await check_conflict(
             calendar, parsed.date, parsed.time, parsed.duration_minutes,
         )
@@ -175,7 +212,6 @@ async def _process_text(
                 )
                 return
 
-            # Check for conflicts at the new time (exclude the event being rescheduled)
             duration = extract_event_duration_minutes(matched)
             conflict = await check_conflict(
                 calendar, parsed.original_date, parsed.new_time,
@@ -233,6 +269,285 @@ async def _process_text(
             await update.message.reply_text(
                 "Couldn't fetch events. Please try again later."
             )
+    elif isinstance(parsed, CancelAllExcept):
+        try:
+            all_events = await calendar.find_events(target_date=parsed.date)
+            if not all_events:
+                await update.message.reply_text(
+                    f"There are no events on {parsed.date} to cancel."
+                )
+                return
+
+            to_cancel = await batch_exclude_events(parsed.exceptions, all_events)
+            if not to_cancel:
+                await update.message.reply_text(
+                    f"All events on {parsed.date} match your exceptions — nothing to cancel."
+                )
+                return
+
+            keep_names = [
+                ev.get("summary", "(no title)") for ev in all_events if ev not in to_cancel
+            ]
+            cancel_names = [ev.get("summary", "(no title)") for ev in to_cancel]
+
+            msg = "*Cancel all except — please confirm:*\n\n"
+            msg += "*Will cancel:*\n"
+            for name in cancel_names:
+                msg += f"  • {name}\n"
+            if keep_names:
+                msg += "\n*Will keep:*\n"
+                for name in keep_names:
+                    msg += f"  • {name}\n"
+
+            context.user_data["pending_batch_cancel"] = [
+                {"id": ev["id"], "summary": ev.get("summary", "(no title)")} for ev in to_cancel
+            ]
+
+            buttons = [
+                [InlineKeyboardButton("Confirm cancel", callback_data="batchcancel:confirm")],
+                [InlineKeyboardButton("Abort", callback_data="batchcancel:abort")],
+            ]
+            await update.message.reply_text(
+                msg, parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(buttons),
+            )
+        except CalendarError as exc:
+            logger.error("Calendar error during cancel-all-except: %s", exc)
+            await update.message.reply_text(
+                "Something went wrong while processing your request. Please try again later."
+            )
+
+
+# ---------------------------------------------------------------------------
+# Batch action execution (no interactive keyboards, collect results)
+# ---------------------------------------------------------------------------
+
+
+async def _execute_batch_actions(
+    actions: list, update: Update, context: ContextTypes.DEFAULT_TYPE,
+) -> list[ActionResult]:
+    """Process multiple actions sequentially, collecting results for a summary."""
+    from src.core.conflict_checker import check_conflict, extract_event_duration_minutes
+    from src.core.parser import (
+        CancelAllExcept, CancelEvent, ParsedEvent, QueryEvents, RescheduleEvent,
+        batch_exclude_events, batch_match_events, match_event,
+    )
+
+    calendar: CalendarPort = context.bot_data["calendar"]
+    results: list[ActionResult] = []
+
+    # Group cancels by date to optimize find_events calls
+    cancel_actions: list[tuple[int, CancelEvent]] = []
+    other_actions: list[tuple[int, Any]] = []
+    for i, action in enumerate(actions):
+        if isinstance(action, CancelEvent):
+            cancel_actions.append((i, action))
+        else:
+            other_actions.append((i, action))
+
+    # Process grouped cancels: one find_events + one batch_match per date
+    if cancel_actions:
+        cancels_by_date: dict[str, list[tuple[int, CancelEvent]]] = {}
+        for idx, action in cancel_actions:
+            cancels_by_date.setdefault(action.date, []).append((idx, action))
+
+        cancel_results_map: dict[int, ActionResult] = {}
+        for date_str, date_cancels in cancels_by_date.items():
+            try:
+                all_events = await calendar.find_events(target_date=date_str)
+                if not all_events:
+                    for idx, action in date_cancels:
+                        cancel_results_map[idx] = ActionResult(
+                            action_type="cancel",
+                            summary=action.event_summary,
+                            success=False,
+                            error_message=f"No events on {date_str}",
+                        )
+                    continue
+
+                descriptions = [action.event_summary for _, action in date_cancels]
+                matched = await batch_match_events(descriptions, all_events)
+
+                for (idx, action), matched_ev in zip(date_cancels, matched):
+                    if matched_ev is None:
+                        cancel_results_map[idx] = ActionResult(
+                            action_type="cancel",
+                            summary=action.event_summary,
+                            success=False,
+                            error_message="Could not find matching event",
+                        )
+                    else:
+                        try:
+                            await calendar.delete_event(matched_ev["id"])
+                            cancel_results_map[idx] = ActionResult(
+                                action_type="cancel",
+                                summary=matched_ev.get("summary", action.event_summary),
+                                success=True,
+                            )
+                        except CalendarError as exc:
+                            cancel_results_map[idx] = ActionResult(
+                                action_type="cancel",
+                                summary=matched_ev.get("summary", action.event_summary),
+                                success=False,
+                                error_message=str(exc),
+                            )
+            except CalendarError as exc:
+                for idx, action in date_cancels:
+                    cancel_results_map[idx] = ActionResult(
+                        action_type="cancel",
+                        summary=action.event_summary,
+                        success=False,
+                        error_message=str(exc),
+                    )
+
+    # Process other actions sequentially
+    other_results_map: dict[int, ActionResult] = {}
+    for idx, action in other_actions:
+        if isinstance(action, ParsedEvent):
+            try:
+                conflict = await check_conflict(
+                    calendar, action.date, action.time, action.duration_minutes,
+                )
+                if conflict.has_conflict:
+                    clashing = ", ".join(
+                        ev.get("summary", "(no title)") for ev in conflict.conflicting_events
+                    )
+                    other_results_map[idx] = ActionResult(
+                        action_type="create",
+                        summary=action.event,
+                        success=False,
+                        error_message=f"Conflict with: {clashing}",
+                    )
+                    continue
+                await calendar.add_event(action)
+                other_results_map[idx] = ActionResult(
+                    action_type="create", summary=action.event, success=True,
+                )
+            except CalendarError as exc:
+                other_results_map[idx] = ActionResult(
+                    action_type="create", summary=action.event, success=False,
+                    error_message=str(exc),
+                )
+        elif isinstance(action, RescheduleEvent):
+            try:
+                all_events = await calendar.find_events(target_date=action.original_date)
+                matched_ev = await match_event(action.event_summary, all_events) if all_events else None
+                if matched_ev is None:
+                    other_results_map[idx] = ActionResult(
+                        action_type="reschedule", summary=action.event_summary,
+                        success=False, error_message="Could not find matching event",
+                    )
+                    continue
+
+                duration = extract_event_duration_minutes(matched_ev)
+                conflict = await check_conflict(
+                    calendar, action.original_date, action.new_time,
+                    duration, exclude_event_id=matched_ev["id"],
+                )
+                if conflict.has_conflict:
+                    clashing = ", ".join(
+                        ev.get("summary", "(no title)") for ev in conflict.conflicting_events
+                    )
+                    other_results_map[idx] = ActionResult(
+                        action_type="reschedule", summary=action.event_summary,
+                        success=False, error_message=f"Conflict with: {clashing}",
+                    )
+                    continue
+
+                await calendar.update_event(matched_ev["id"], action.original_date, action.new_time)
+                other_results_map[idx] = ActionResult(
+                    action_type="reschedule", summary=action.event_summary, success=True,
+                )
+            except CalendarError as exc:
+                other_results_map[idx] = ActionResult(
+                    action_type="reschedule", summary=action.event_summary,
+                    success=False, error_message=str(exc),
+                )
+        elif isinstance(action, QueryEvents):
+            try:
+                events = await calendar.find_events(target_date=action.date)
+                if not events:
+                    other_results_map[idx] = ActionResult(
+                        action_type="query", summary=f"No events on {action.date}",
+                        success=True,
+                    )
+                else:
+                    lines = []
+                    for ev in events:
+                        start = ev.get("start_time", "")
+                        if "T" in start:
+                            start = start.split("T")[1][:5]
+                        summary = ev.get("summary", "(no title)")
+                        lines.append(f"{start} {summary}")
+                    other_results_map[idx] = ActionResult(
+                        action_type="query", summary="; ".join(lines), success=True,
+                    )
+            except CalendarError as exc:
+                other_results_map[idx] = ActionResult(
+                    action_type="query", summary=f"Query {action.date}",
+                    success=False, error_message=str(exc),
+                )
+        elif isinstance(action, CancelAllExcept):
+            try:
+                all_events = await calendar.find_events(target_date=action.date)
+                if not all_events:
+                    other_results_map[idx] = ActionResult(
+                        action_type="cancel_all_except",
+                        summary=f"No events on {action.date}",
+                        success=False, error_message=f"No events on {action.date}",
+                    )
+                    continue
+
+                to_cancel = await batch_exclude_events(action.exceptions, all_events)
+                if not to_cancel:
+                    other_results_map[idx] = ActionResult(
+                        action_type="cancel_all_except",
+                        summary="Nothing to cancel — all events match exceptions",
+                        success=True,
+                    )
+                    continue
+
+                canceled_names = []
+                for ev in to_cancel:
+                    try:
+                        await calendar.delete_event(ev["id"])
+                        canceled_names.append(ev.get("summary", "(no title)"))
+                    except CalendarError:
+                        pass
+
+                other_results_map[idx] = ActionResult(
+                    action_type="cancel_all_except",
+                    summary=f"Canceled {len(canceled_names)} events",
+                    success=True,
+                )
+            except CalendarError as exc:
+                other_results_map[idx] = ActionResult(
+                    action_type="cancel_all_except",
+                    summary="Cancel all except",
+                    success=False, error_message=str(exc),
+                )
+
+    # Reassemble results in original order
+    all_results_map = {}
+    if cancel_actions:
+        all_results_map.update(cancel_results_map)
+    all_results_map.update(other_results_map)
+
+    return [all_results_map[i] for i in sorted(all_results_map.keys())]
+
+
+async def _send_batch_summary(
+    results: list[ActionResult], update: Update,
+) -> None:
+    """Format and send a summary of batch action results."""
+    lines = [f"*Processed {len(results)} actions:*\n"]
+    for r in results:
+        if r.success:
+            lines.append(f'✅ {r.action_type.replace("_", " ").title()}: "{r.summary}"')
+        else:
+            lines.append(
+                f'❌ {r.action_type.replace("_", " ").title()}: "{r.summary}" — {r.error_message}'
+            )
+    await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
 
 
 # ---------------------------------------------------------------------------
@@ -451,6 +766,55 @@ async def _handle_custom_time(
             )
 
     context.user_data.pop("pending_event", None)
+
+
+# ---------------------------------------------------------------------------
+# Batch cancel confirmation callback
+# ---------------------------------------------------------------------------
+
+
+async def _handle_batch_cancel_callback(
+    update: Update, context: ContextTypes.DEFAULT_TYPE,
+) -> None:
+    """Handle confirmation/abort for cancel-all-except flow."""
+    query = update.callback_query
+    await query.answer()
+
+    user = query.from_user
+    if user is None or user.id not in settings.ALLOWED_USER_IDS:
+        return
+
+    action = query.data.split(":")[1]
+    pending = context.user_data.pop("pending_batch_cancel", None)
+
+    if action == "abort":
+        await query.edit_message_text("Batch cancel aborted.")
+        return
+
+    if action == "confirm":
+        if not pending:
+            await query.edit_message_text("No pending cancel found. Please try again.")
+            return
+
+        calendar: CalendarPort = context.bot_data["calendar"]
+        succeeded = []
+        failed = []
+
+        for ev in pending:
+            try:
+                await calendar.delete_event(ev["id"])
+                succeeded.append(ev["summary"])
+            except CalendarError as exc:
+                logger.error("Failed to cancel '%s': %s", ev["summary"], exc)
+                failed.append(ev["summary"])
+
+        lines = []
+        for name in succeeded:
+            lines.append(f"✅ Canceled: *{name}*")
+        for name in failed:
+            lines.append(f"❌ Failed to cancel: *{name}*")
+
+        await query.edit_message_text("\n".join(lines), parse_mode="Markdown")
 
 
 # ---------------------------------------------------------------------------
@@ -1048,6 +1412,7 @@ def build_app(
     app.add_handler(CommandHandler("deletechore", cmd_deletechore))
     app.add_handler(CallbackQueryHandler(_handle_deletechore_callback, pattern=r"^delchore:\d+$"))
     app.add_handler(CallbackQueryHandler(_handle_conflict_callback, pattern=r"^conflict:"))
+    app.add_handler(CallbackQueryHandler(_handle_batch_cancel_callback, pattern=r"^batchcancel:"))
 
     # /addchore conversation handler
     _text = filters.TEXT & ~filters.COMMAND
