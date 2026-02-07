@@ -122,6 +122,25 @@ class TestBuildVevent:
         )
         assert "ATTENDEE" not in result
 
+    def test_builds_vevent_with_location(self):
+        result = _build_vevent(
+            summary="Meeting",
+            description="",
+            start_dt=datetime(2026, 2, 14, 10, 0),
+            end_dt=datetime(2026, 2, 14, 11, 0),
+            location="Blue Bottle Coffee, 315 Linden St",
+        )
+        assert "LOCATION:Blue Bottle Coffee" in result
+
+    def test_builds_vevent_without_location(self):
+        result = _build_vevent(
+            summary="Meeting",
+            description="",
+            start_dt=datetime(2026, 2, 14, 10, 0),
+            end_dt=datetime(2026, 2, 14, 11, 0),
+        )
+        assert "LOCATION" not in result
+
 
 # ---------------------------------------------------------------------------
 # Tests for _parse_vevent

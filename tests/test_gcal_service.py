@@ -83,6 +83,23 @@ class TestBuildEventBody:
         body = _build_event_body(parsed)
         assert "attendees" not in body
 
+    def test_builds_body_with_location(self):
+        parsed = ParsedEvent(
+            event="Meeting", date="2026-02-14", time="14:00",
+            duration_minutes=60, description="",
+            location="Blue Bottle Coffee, 315 Linden St",
+        )
+        body = _build_event_body(parsed)
+        assert body["location"] == "Blue Bottle Coffee, 315 Linden St"
+
+    def test_builds_body_without_location(self):
+        parsed = ParsedEvent(
+            event="Meeting", date="2026-02-14", time="14:00",
+            duration_minutes=60, description="",
+        )
+        body = _build_event_body(parsed)
+        assert "location" not in body
+
 
 # ---------------------------------------------------------------------------
 # Tests for add_event

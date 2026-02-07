@@ -390,3 +390,31 @@ class TestMentionedContacts:
         )
         assert p.mentioned_contacts == []
         assert p.guests == []
+
+
+# ---------------------------------------------------------------------------
+# Tests for location field
+# ---------------------------------------------------------------------------
+
+
+class TestLocationField:
+    def test_location_defaults_to_empty(self):
+        p = ParsedEvent(event="Lunch", date="2026-02-14", time="12:00")
+        assert p.location == ""
+
+    @pytest.mark.asyncio
+    async def test_parse_event_with_location(self):
+        llm_response = '[{"intent": "create", "event": "Meeting", "date": "2026-02-14", "time": "14:00", "duration_minutes": 60, "description": "", "guests": [], "mentioned_contacts": [], "location": "Blue Bottle Coffee"}]'
+        with patch("src.core.parser.complete", AsyncMock(return_value=llm_response)):
+            result = await parse_message("Meeting at Blue Bottle Coffee tomorrow at 14:00")
+        assert len(result) == 1
+        assert isinstance(result[0], ParsedEvent)
+        assert result[0].location == "Blue Bottle Coffee"
+
+    def test_backward_compat_no_location_field(self):
+        """Old LLM responses without location field still work."""
+        p = ParsedEvent(
+            intent="create", event="Dentist", date="2026-02-14",
+            time="16:00", duration_minutes=60, description="",
+        )
+        assert p.location == ""

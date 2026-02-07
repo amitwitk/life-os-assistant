@@ -62,6 +62,9 @@ class Settings(BaseModel):
     MORNING_BRIEFING_HOUR: int = 8
     TIMEZONE: str = "Asia/Jerusalem"
 
+    # Google Maps Places API (optional — location enrichment)
+    GOOGLE_MAPS_API_KEY: str = ""
+
     @field_validator("ALLOWED_USER_IDS", mode="before")
     @classmethod
     def parse_user_ids(cls, v: str | list[int]) -> list[int]:
@@ -111,6 +114,7 @@ def _load_settings() -> Settings:
         ALLOWED_USER_IDS=os.getenv("ALLOWED_USER_IDS", ""),
         MORNING_BRIEFING_HOUR=os.getenv("MORNING_BRIEFING_HOUR", "8"),
         TIMEZONE=os.getenv("TIMEZONE", "Asia/Jerusalem"),
+        GOOGLE_MAPS_API_KEY=os.getenv("GOOGLE_MAPS_API_KEY", ""),
     )
 
 

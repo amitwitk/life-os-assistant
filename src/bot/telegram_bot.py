@@ -122,6 +122,8 @@ async def _render_response(
         msg = response.message
         if response.event and response.event.link:
             msg += f"\n[Open in Google Calendar]({response.event.link})"
+        if response.event and response.event.maps_url:
+            msg += f"\n[\U0001f5fa Open in Google Maps]({response.event.maps_url})"
         await update.message.reply_text(msg, parse_mode="Markdown")
 
     elif isinstance(response, (QueryResultResponse, BatchSummaryResponse)):
@@ -194,6 +196,8 @@ async def _handle_conflict_callback(
     msg = response.message
     if isinstance(response, SuccessResponse) and response.event and response.event.link:
         msg += f"\n[Open in Google Calendar]({response.event.link})"
+    if isinstance(response, SuccessResponse) and response.event and response.event.maps_url:
+        msg += f"\n[\U0001f5fa Open in Google Maps]({response.event.maps_url})"
     await query.edit_message_text(msg, parse_mode="Markdown")
 
     context.user_data.pop("pending_event", None)
@@ -217,6 +221,8 @@ async def _handle_custom_time(
         msg = response.message
         if response.event and response.event.link:
             msg += f"\n[Open in Google Calendar]({response.event.link})"
+        if response.event and response.event.maps_url:
+            msg += f"\n[\U0001f5fa Open in Google Maps]({response.event.maps_url})"
         await update.message.reply_text(msg, parse_mode="Markdown")
     elif isinstance(response, ErrorResponse):
         await update.message.reply_text(response.message)

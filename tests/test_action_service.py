@@ -1094,3 +1094,118 @@ class TestContactResolution:
 
         assert isinstance(response, ContactPromptResponse)
         assert response.contact_name == "Yahav"
+
+
+# ---------------------------------------------------------------------------
+# Location enrichment
+# ---------------------------------------------------------------------------
+
+
+class TestLocationEnrichment:
+    @pytest.mark.asyncio
+    async def test_create_with_location_enriched(self):
+        """Event with location should be enriched via Google Maps."""
+        from src.core.parser import ParsedEvent
+        from src.core.conflict_checker import ConflictResult
+        from src.integrations.google_maps import EnrichedLocation
+
+        service, cal = _make_service()
+        cal.add_event = AsyncMock(return_value={"htmlLink": "https://cal/1"})
+
+        parsed = ParsedEvent(
+            event="Meeting", date="2026-02-08", time="14:00",
+            location="Blue Bottle Coffee",
+        )
+        no_conflict = ConflictResult(has_conflict=False)
+        enriched = EnrichedLocation(
+            display_name="Blue Bottle Coffee",
+            formatted_address="315 Linden St, San Francisco, CA 94102",
+            maps_url="https://www.google.com/maps/search/?api=1&query=315+Linden+St",
+        )
+
+        with patch("src.core.parser.parse_message", AsyncMock(return_value=[parsed])), \
+             patch("src.core.conflict_checker.check_conflict", AsyncMock(return_value=no_conflict)), \
+             patch("src.config.settings") as mock_settings, \
+             patch("src.integrations.google_maps.enrich_location", AsyncMock(return_value=enriched)):
+            mock_settings.GOOGLE_MAPS_API_KEY = "fake-key"
+            response = await service.process_text("Meeting at Blue Bottle Coffee at 14:00")
+
+        assert isinstance(response, SuccessResponse)
+        assert "\U0001f4cd" in response.message
+        assert "Blue Bottle Coffee" in response.message
+        assert response.event.maps_url == "https://www.google.com/maps/search/?api=1&query=315+Linden+St"
+        assert "Blue Bottle Coffee" in response.event.location
+
+    @pytest.mark.asyncio
+    async def test_create_with_location_no_api_key(self):
+        """No API key → raw location text used, no maps URL."""
+        from src.core.parser import ParsedEvent
+        from src.core.conflict_checker import ConflictResult
+
+        service, cal = _make_service()
+        cal.add_event = AsyncMock(return_value={"htmlLink": ""})
+
+        parsed = ParsedEvent(
+            event="Meeting", date="2026-02-08", time="14:00",
+            location="The Office",
+        )
+        no_conflict = ConflictResult(has_conflict=False)
+
+        with patch("src.core.parser.parse_message", AsyncMock(return_value=[parsed])), \
+             patch("src.core.conflict_checker.check_conflict", AsyncMock(return_value=no_conflict)), \
+             patch("src.config.settings") as mock_settings:
+            mock_settings.GOOGLE_MAPS_API_KEY = ""
+            response = await service.process_text("Meeting at the office at 14:00")
+
+        assert isinstance(response, SuccessResponse)
+        assert response.event.location == "The Office"
+        assert response.event.maps_url == ""
+
+    @pytest.mark.asyncio
+    async def test_create_with_location_maps_fails(self):
+        """Maps API failure → raw location text used as fallback."""
+        from src.core.parser import ParsedEvent
+        from src.core.conflict_checker import ConflictResult
+
+        service, cal = _make_service()
+        cal.add_event = AsyncMock(return_value={"htmlLink": ""})
+
+        parsed = ParsedEvent(
+            event="Meeting", date="2026-02-08", time="14:00",
+            location="Some Place",
+        )
+        no_conflict = ConflictResult(has_conflict=False)
+
+        with patch("src.core.parser.parse_message", AsyncMock(return_value=[parsed])), \
+             patch("src.core.conflict_checker.check_conflict", AsyncMock(return_value=no_conflict)), \
+             patch("src.config.settings") as mock_settings, \
+             patch("src.integrations.google_maps.enrich_location", AsyncMock(return_value=None)):
+            mock_settings.GOOGLE_MAPS_API_KEY = "fake-key"
+            response = await service.process_text("Meeting at Some Place at 14:00")
+
+        assert isinstance(response, SuccessResponse)
+        assert response.event.location == "Some Place"
+        assert response.event.maps_url == ""
+
+    @pytest.mark.asyncio
+    async def test_create_without_location(self):
+        """Event without location → no location in EventInfo."""
+        from src.core.parser import ParsedEvent
+        from src.core.conflict_checker import ConflictResult
+
+        service, cal = _make_service()
+        cal.add_event = AsyncMock(return_value={"htmlLink": ""})
+
+        parsed = ParsedEvent(
+            event="Meeting", date="2026-02-08", time="14:00",
+        )
+        no_conflict = ConflictResult(has_conflict=False)
+
+        with patch("src.core.parser.parse_message", AsyncMock(return_value=[parsed])), \
+             patch("src.core.conflict_checker.check_conflict", AsyncMock(return_value=no_conflict)):
+            response = await service.process_text("Meeting at 14:00")
+
+        assert isinstance(response, SuccessResponse)
+        assert response.event.location == ""
+        assert response.event.maps_url == ""
+        assert "\U0001f4cd" not in response.message

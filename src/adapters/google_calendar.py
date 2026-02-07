@@ -38,6 +38,8 @@ def _build_event_body(parsed_event: ParsedEvent) -> dict:
     }
     if parsed_event.guests:
         body["attendees"] = [{"email": g} for g in parsed_event.guests]
+    if parsed_event.location:
+        body["location"] = parsed_event.location
     return body
 
 

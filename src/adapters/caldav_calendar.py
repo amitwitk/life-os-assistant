@@ -57,6 +57,7 @@ def _build_vevent(
     uid: str | None = None,
     rrule: str | None = None,
     attendees: list[str] | None = None,
+    location: str = "",
 ) -> str:
     """Build an iCalendar VEVENT string."""
     cal = iCalendar()
@@ -77,6 +78,9 @@ def _build_vevent(
             key, _, value = part.partition("=")
             parts[key] = value
         event.add("rrule", parts)
+
+    if location:
+        event.add("location", location)
 
     if attendees:
         for email in attendees:
@@ -157,6 +161,7 @@ class CalDAVCalendarAdapter:
             end_dt=end_dt,
             uid=uid,
             attendees=parsed_event.guests or None,
+            location=parsed_event.location,
         )
 
         try:

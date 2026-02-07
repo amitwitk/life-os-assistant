@@ -49,6 +49,8 @@ class EventInfo:
     date: str
     time: str
     link: str = ""
+    location: str = ""
+    maps_url: str = ""
 
 
 @dataclass
@@ -297,14 +299,23 @@ class ActionService:
                 from src.core.parser import ParsedEvent
                 pending.parsed_event_json["time"] = time_to_use
                 parsed = ParsedEvent(**pending.parsed_event_json)
+
+                location_display, maps_url = await self._enrich_location(parsed.location)
+                if location_display and location_display != parsed.location:
+                    parsed = parsed.model_copy(update={"location": location_display})
+
                 created = await self._calendar.add_event(parsed)
                 link = created.get("htmlLink", "")
+                msg = f"\u2705 Event created: *{parsed.event}* on {parsed.date} at {time_to_use}"
+                if location_display:
+                    msg += f"\n\U0001f4cd {location_display}"
                 return SuccessResponse(
                     kind=ResponseKind.SUCCESS,
-                    message=f"\u2705 Event created: *{parsed.event}* on {parsed.date} at {time_to_use}",
+                    message=msg,
                     event=EventInfo(
                         summary=parsed.event, date=parsed.date,
                         time=time_to_use, link=link,
+                        location=location_display, maps_url=maps_url,
                     ),
                 )
             elif pending.pending_type == "reschedule":
@@ -542,6 +553,36 @@ class ActionService:
         return db.mark_done(chore_id)
 
     # ------------------------------------------------------------------
+    # Internal: location enrichment
+    # ------------------------------------------------------------------
+
+    async def _enrich_location(self, raw_location: str) -> tuple[str, str]:
+        """Enrich a raw location string via Google Maps Places API.
+
+        Returns (location_display_str, maps_url). Falls back to raw text
+        if no API key is set or the API call fails.
+        """
+        if not raw_location:
+            return ("", "")
+
+        from src.config import settings
+
+        if not settings.GOOGLE_MAPS_API_KEY:
+            return (raw_location, "")
+
+        from src.integrations.google_maps import enrich_location
+
+        result = await enrich_location(raw_location, settings.GOOGLE_MAPS_API_KEY)
+        if result is None:
+            return (raw_location, "")
+
+        if result.formatted_address:
+            display = f"{result.display_name}, {result.formatted_address}"
+        else:
+            display = result.display_name
+        return (display, result.maps_url)
+
+    # ------------------------------------------------------------------
     # Public: contact resolution
     # ------------------------------------------------------------------
 
@@ -660,6 +701,11 @@ class ActionService:
                 merged = list({e.lower(): e for e in existing + all_emails}.values())
                 parsed = parsed.model_copy(update={"guests": merged, "mentioned_contacts": []})
 
+            # --- Location enrichment ---
+            location_display, maps_url = await self._enrich_location(parsed.location)
+            if location_display and location_display != parsed.location:
+                parsed = parsed.model_copy(update={"location": location_display})
+
             # --- Conflict check ---
             conflict = await check_conflict(
                 self._calendar, parsed.date, parsed.time, parsed.duration_minutes,
@@ -676,12 +722,16 @@ class ActionService:
             try:
                 created = await self._calendar.add_event(parsed)
                 link = created.get("htmlLink", "")
+                msg = f"\u2705 Event created: *{parsed.event}* on {parsed.date} at {parsed.time}"
+                if location_display:
+                    msg += f"\n\U0001f4cd {location_display}"
                 return SuccessResponse(
                     kind=ResponseKind.SUCCESS,
-                    message=f"\u2705 Event created: *{parsed.event}* on {parsed.date} at {parsed.time}",
+                    message=msg,
                     event=EventInfo(
                         summary=parsed.event, date=parsed.date,
                         time=parsed.time, link=link,
+                        location=location_display, maps_url=maps_url,
                     ),
                 )
             except CalendarError as exc:
@@ -1010,6 +1060,11 @@ class ActionService:
                     action = action.model_copy(update={"guests": merged, "mentioned_contacts": []})
 
                 try:
+                    # Enrich location in batch mode
+                    location_display, _ = await self._enrich_location(action.location)
+                    if location_display and location_display != action.location:
+                        action = action.model_copy(update={"location": location_display})
+
                     conflict = await check_conflict(
                         self._calendar, action.date, action.time, action.duration_minutes,
                     )

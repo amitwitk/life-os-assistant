@@ -12,6 +12,7 @@ os.environ.setdefault("LLM_API_KEY", "fake-llm-key-for-tests")
 os.environ.setdefault("LLM_PROVIDER", "gemini")
 os.environ.setdefault("ALLOWED_USER_IDS", "12345")
 os.environ.setdefault("DATABASE_PATH", ":memory:")
+os.environ.setdefault("GOOGLE_MAPS_API_KEY", "")
 
 import pytest
 import tempfile

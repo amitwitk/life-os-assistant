@@ -48,6 +48,7 @@ class ParsedEvent(BaseModel):
     description: str = ""
     guests: list[str] = []                # explicit email addresses
     mentioned_contacts: list[str] = []    # person names to resolve via contacts DB
+    location: str = ""                    # physical venue, address, or place name
 
 
 class CancelEvent(BaseModel):
@@ -145,7 +146,7 @@ Today's date is {today}.
 
 **Function 1: Create Event**
 If the user wants to schedule something, use this JSON schema:
-{{"intent": "create", "event": "string", "date": "YYYY-MM-DD", "time": "HH:MM", "duration_minutes": integer, "description": "string", "guests": ["email@example.com"], "mentioned_contacts": ["PersonName"]}}
+{{"intent": "create", "event": "string", "date": "YYYY-MM-DD", "time": "HH:MM", "duration_minutes": integer, "description": "string", "guests": ["email@example.com"], "mentioned_contacts": ["PersonName"], "location": "string"}}
 
 - "event" = short title for the calendar event.
 - "time" must be in 24-hour format.
@@ -156,6 +157,8 @@ If the user wants to schedule something, use this JSON schema:
 - "mentioned_contacts" = list of people's NAMES mentioned as participants.
   e.g., "meeting with Yahav and Dan" → ["Yahav", "Dan"]. Default to [].
   Only include actual person names, not generic descriptions like "the team".
+- "location" = the physical venue, address, or place name. Default to "".
+  Only extract if the user mentions a specific place (e.g., "at Blue Bottle Coffee", "in the office").
 
 **Function 2: Cancel Event**
 If the user's message contains keywords like "cancel", "delete", "remove", "ביטול", "בטל", "למחיקה", use this JSON schema:
