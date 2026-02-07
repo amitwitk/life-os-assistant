@@ -5,9 +5,13 @@ from unittest.mock import AsyncMock, MagicMock
 
 from src.core.conflict_checker import (
     ConflictResult,
+    FreeSlotResult,
     check_conflict,
     extract_event_duration_minutes,
+    find_free_slots,
     find_nearest_free_slot,
+    get_free_slots,
+    spread_slots,
 )
 
 
@@ -167,3 +171,184 @@ class TestCheckConflict:
         cal = _mock_calendar(events=[])
         result = await check_conflict(cal, "2026-02-07", "invalid", 60)
         assert result.has_conflict is False
+
+
+# ---------------------------------------------------------------------------
+# Tests for find_free_slots
+# ---------------------------------------------------------------------------
+
+
+class TestFindFreeSlots:
+    def test_empty_day_returns_max_slots(self):
+        result = find_free_slots([], 60, max_slots=5)
+        assert len(result) == 5
+        assert result[0] == "08:00"
+        assert result[1] == "08:30"
+        assert result[2] == "09:00"
+        assert result[3] == "09:30"
+        assert result[4] == "10:00"
+
+    def test_busy_block_finds_slots_around_it(self):
+        # Busy 10:00-11:00 (600-660)
+        busy = [(600, 660)]
+        result = find_free_slots(busy, 60, max_slots=5)
+        # Should include 08:00, 08:30, 09:00 (before busy) but NOT 10:00 or 10:30
+        assert "08:00" in result
+        assert "09:00" in result
+        assert "10:00" not in result
+        # 11:00 should be available
+        assert "11:00" in result
+
+    def test_respects_max_slots(self):
+        result = find_free_slots([], 60, max_slots=3)
+        assert len(result) == 3
+
+    def test_respects_duration(self):
+        # Busy 09:00-09:30 (540-570) — a 60-min slot at 08:30 would overlap
+        busy = [(540, 570)]
+        result = find_free_slots(busy, 60, max_slots=10)
+        assert "08:30" not in result
+        assert "08:00" in result  # 08:00-09:00 fits
+
+    def test_respects_day_bounds(self):
+        # day_start=600 (10:00), day_end=720 (12:00), duration 60
+        result = find_free_slots([], 60, max_slots=10, day_start=600, day_end=720)
+        assert result == ["10:00", "10:30", "11:00"]
+
+    def test_fully_booked_returns_empty(self):
+        # Busy from 08:00 to 20:00
+        busy = [(480, 1200)]
+        result = find_free_slots(busy, 60)
+        assert result == []
+
+    def test_all_day_events_ignored_implicitly(self):
+        # All-day events have no start/end time — they aren't included in busy_intervals
+        # by the caller. With empty busy, all slots should be available.
+        result = find_free_slots([], 30, max_slots=3)
+        assert len(result) == 3
+
+    def test_current_minutes_filters_past_slots(self):
+        # Current time is 10:15 → effective start rounds up to 10:30
+        result = find_free_slots([], 60, max_slots=3, current_minutes=615)
+        assert result[0] == "10:30"
+        assert "08:00" not in result
+        assert "10:00" not in result
+
+    def test_current_minutes_on_30_min_boundary(self):
+        # Current time is exactly 10:00 → start at 10:00
+        result = find_free_slots([], 60, max_slots=3, current_minutes=600)
+        assert result[0] == "10:00"
+
+    def test_max_slots_zero_returns_all(self):
+        # max_slots=0 means unlimited — should return all available
+        result = find_free_slots([], 60, max_slots=0, day_start=600, day_end=720)
+        assert result == ["10:00", "10:30", "11:00"]
+
+
+# ---------------------------------------------------------------------------
+# Tests for spread_slots
+# ---------------------------------------------------------------------------
+
+
+class TestSpreadSlots:
+    def test_returns_all_when_fewer_than_max(self):
+        slots = ["08:00", "09:00", "10:00"]
+        assert spread_slots(slots, max_slots=5) == slots
+
+    def test_returns_all_when_equal_to_max(self):
+        slots = ["08:00", "09:00", "10:00", "11:00", "12:00"]
+        assert spread_slots(slots, max_slots=5) == slots
+
+    def test_spreads_evenly_across_range(self):
+        # 10 slots, pick 5 → should include first and last
+        all_slots = [
+            "08:00", "08:30", "09:00", "09:30", "10:00",
+            "10:30", "11:00", "11:30", "12:00", "12:30",
+        ]
+        result = spread_slots(all_slots, max_slots=5)
+        assert len(result) == 5
+        assert result[0] == "08:00"   # first
+        assert result[-1] == "12:30"  # last
+        # Should NOT be 5 consecutive slots
+        assert result != all_slots[:5]
+
+    def test_spread_single_slot(self):
+        all_slots = ["08:00", "09:00", "10:00", "11:00", "12:00"]
+        result = spread_slots(all_slots, max_slots=1)
+        assert len(result) == 1
+        assert result[0] == "10:00"  # middle
+
+    def test_empty_input(self):
+        assert spread_slots([], max_slots=5) == []
+
+
+# ---------------------------------------------------------------------------
+# Tests for get_free_slots
+# ---------------------------------------------------------------------------
+
+
+class TestGetFreeSlots:
+    @pytest.mark.asyncio
+    async def test_returns_free_slot_result(self):
+        cal = _mock_calendar(events=[])
+        result = await get_free_slots(cal, "2099-01-01", 60, max_slots=3)
+        assert isinstance(result, FreeSlotResult)
+        assert len(result.suggested) == 3
+        assert result.suggested[0] == "08:00"
+        # all_available should have more slots than suggested
+        assert len(result.all_available) > len(result.suggested)
+
+    @pytest.mark.asyncio
+    async def test_suggested_slots_are_spread(self):
+        cal = _mock_calendar(events=[])
+        result = await get_free_slots(cal, "2099-01-01", 60, max_slots=5)
+        assert len(result.suggested) == 5
+        # Verify spread: first and last should not be adjacent
+        assert result.suggested[0] == "08:00"
+        assert result.suggested[-1] != "10:00"  # NOT consecutive
+
+    @pytest.mark.asyncio
+    async def test_skips_busy_events(self):
+        cal = _mock_calendar(events=[
+            {"id": "1", "summary": "Meeting", "start_time": "09:00", "end_time": "10:00"},
+        ])
+        result = await get_free_slots(cal, "2099-01-01", 60, max_slots=5)
+        assert "09:00" not in result.all_available
+        assert "09:30" not in result.all_available
+        assert "08:00" in result.all_available
+
+    @pytest.mark.asyncio
+    async def test_calendar_error_returns_empty_result(self):
+        cal = _mock_calendar(side_effect=Exception("API down"))
+        result = await get_free_slots(cal, "2099-01-01", 60)
+        assert isinstance(result, FreeSlotResult)
+        assert result.suggested == []
+        assert result.all_available == []
+
+    @pytest.mark.asyncio
+    async def test_all_day_events_ignored(self):
+        cal = _mock_calendar(events=[
+            {"id": "1", "summary": "Holiday", "start_time": "", "end_time": ""},
+        ])
+        result = await get_free_slots(cal, "2099-01-01", 60, max_slots=3)
+        assert len(result.suggested) == 3
+
+    @pytest.mark.asyncio
+    async def test_today_filters_past_times(self):
+        from unittest.mock import patch as mock_patch
+        from datetime import date as d, datetime as dt
+
+        cal = _mock_calendar(events=[])
+        # Mock "today" and "now" to 14:00
+        fake_today = d(2099, 1, 1)
+        fake_now = dt(2099, 1, 1, 14, 0)
+        with mock_patch("src.core.conflict_checker.date") as mock_date, \
+             mock_patch("src.core.conflict_checker.datetime") as mock_datetime:
+            mock_date.today.return_value = fake_today
+            mock_datetime.now.return_value = fake_now
+            result = await get_free_slots(cal, "2099-01-01", 60, max_slots=5)
+
+        # No slot should be before 14:00
+        for slot in result.all_available:
+            h, m = map(int, slot.split(":"))
+            assert h * 60 + m >= 14 * 60

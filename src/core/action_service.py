@@ -41,6 +41,7 @@ class ResponseKind(Enum):
     QUERY_RESULT = "query_result"
     BATCH_SUMMARY = "batch_summary"
     NO_ACTION = "no_action"
+    SLOT_SUGGESTION = "slot_suggestion"
 
 
 @dataclass
@@ -128,6 +129,20 @@ class QueryResultResponse(ServiceResponse):
 @dataclass
 class BatchSummaryResponse(ServiceResponse):
     results: list[ActionResult] = field(default_factory=list)
+
+
+@dataclass
+class SlotOption:
+    time: str    # "HH:MM"
+    label: str   # "09:00" or "09:00 AM"
+
+
+@dataclass
+class SlotSuggestionResponse(ServiceResponse):
+    slots: list[SlotOption] = field(default_factory=list)
+    pending: PendingEvent | None = None
+    is_flexible: bool = True
+    all_free_slots: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -622,6 +637,168 @@ class ActionService:
         return await self._execute_single_action(parsed)
 
     # ------------------------------------------------------------------
+    # Enricher pipeline for create events
+    # ------------------------------------------------------------------
+
+    _CREATE_PIPELINE = ["_enrich_contacts", "_enrich_time", "_enrich_conflicts"]
+
+    async def _enrich_contacts(self, parsed: object) -> object | ServiceResponse:
+        """Resolve mentioned contacts into guest emails.
+
+        Returns:
+            ParsedEvent with guests populated, or ContactPromptResponse if unknown contacts.
+        """
+        from src.core.parser import ParsedEvent
+
+        if not isinstance(parsed, ParsedEvent) or not parsed.mentioned_contacts:
+            return parsed
+
+        resolved, unresolved = self._resolve_contacts(
+            parsed.mentioned_contacts, parsed.guests,
+        )
+        if unresolved:
+            first_unknown = unresolved[0]
+            pending = PendingContactResolution(
+                action_type="create",
+                parsed_action_json=parsed.model_dump(),
+                resolved_contacts=resolved,
+                unresolved_contacts=unresolved,
+                current_asking=first_unknown,
+            )
+            return ContactPromptResponse(
+                kind=ResponseKind.CONTACT_PROMPT,
+                message=f"I don't have an email for *{first_unknown}*. What's their email?",
+                contact_name=first_unknown,
+                pending=pending,
+            )
+        # All contacts resolved — merge emails into guests
+        all_emails = list(resolved.values())
+        existing = parsed.guests
+        merged = list({e.lower(): e for e in existing + all_emails}.values())
+        return parsed.model_copy(update={"guests": merged, "mentioned_contacts": []})
+
+    async def _enrich_time(self, parsed: object) -> object | ServiceResponse:
+        """Suggest time slots if no time is specified.
+
+        Returns:
+            ParsedEvent unchanged if time is present, or SlotSuggestionResponse.
+        """
+        from src.core.parser import ParsedEvent
+
+        if not isinstance(parsed, ParsedEvent) or parsed.time:
+            return parsed
+
+        return await self._suggest_slots(parsed)
+
+    async def _enrich_conflicts(self, parsed: object) -> object | ServiceResponse:
+        """Check for time conflicts before creating.
+
+        Returns:
+            ParsedEvent unchanged if no conflict, or ConflictPromptResponse.
+        """
+        from src.core.conflict_checker import check_conflict
+        from src.core.parser import ParsedEvent
+
+        if not isinstance(parsed, ParsedEvent):
+            return parsed
+
+        conflict = await check_conflict(
+            self._calendar, parsed.date, parsed.time, parsed.duration_minutes,
+        )
+        if conflict.has_conflict:
+            return self._build_conflict_response(
+                conflict, parsed.time,
+                PendingEvent(
+                    pending_type="create",
+                    parsed_event_json=parsed.model_dump(),
+                ),
+            )
+        return parsed
+
+    async def _create_event(self, parsed: object) -> ServiceResponse:
+        """Create the calendar event after all enrichers have passed."""
+        from src.core.parser import ParsedEvent
+
+        if not isinstance(parsed, ParsedEvent):
+            return ErrorResponse(
+                kind=ResponseKind.ERROR,
+                message="Internal error: expected ParsedEvent for event creation.",
+            )
+
+        try:
+            created = await self._calendar.add_event(parsed)
+            link = created.get("htmlLink", "")
+            return SuccessResponse(
+                kind=ResponseKind.SUCCESS,
+                message=f"\u2705 Event created: *{parsed.event}* on {parsed.date} at {parsed.time}",
+                event=EventInfo(
+                    summary=parsed.event, date=parsed.date,
+                    time=parsed.time, link=link,
+                ),
+            )
+        except CalendarError as exc:
+            logger.error("Calendar write error: %s", exc)
+            return ErrorResponse(
+                kind=ResponseKind.ERROR,
+                message="I parsed your event but couldn't save it to Google Calendar. Please try again later.",
+            )
+
+    async def _run_create_pipeline(self, parsed: object) -> ServiceResponse:
+        """Run the create enricher pipeline, stopping at the first pause."""
+        for step_name in self._CREATE_PIPELINE:
+            result = await getattr(self, step_name)(parsed)
+            if isinstance(result, ServiceResponse):
+                return result     # Paused — need user input
+            parsed = result       # Enriched — continue
+        return await self._create_event(parsed)
+
+    async def _run_create_pipeline_batch(self, parsed: object) -> ActionResult:
+        """Run the create pipeline in batch mode, converting pauses to errors."""
+        from src.core.parser import ParsedEvent
+
+        for step_name in self._CREATE_PIPELINE:
+            result = await getattr(self, step_name)(parsed)
+            if isinstance(result, ServiceResponse):
+                return ActionResult(
+                    action_type="create",
+                    summary=parsed.event if isinstance(parsed, ParsedEvent) else "Unknown",
+                    success=False,
+                    error_message=self._batch_error_from_response(result),
+                )
+            parsed = result
+
+        if not isinstance(parsed, ParsedEvent):
+            return ActionResult(
+                action_type="create", summary="Unknown",
+                success=False, error_message="Internal error",
+            )
+
+        try:
+            await self._calendar.add_event(parsed)
+            return ActionResult(
+                action_type="create", summary=parsed.event, success=True,
+            )
+        except CalendarError as exc:
+            return ActionResult(
+                action_type="create", summary=parsed.event,
+                success=False, error_message=str(exc),
+            )
+
+    @staticmethod
+    def _batch_error_from_response(response: ServiceResponse) -> str:
+        """Convert a pipeline pause response into a batch error message."""
+        if isinstance(response, ContactPromptResponse):
+            pending = response.pending
+            if pending:
+                return f"Unknown contact: {', '.join(pending.unresolved_contacts)}"
+            return f"Unknown contact: {response.contact_name}"
+        if isinstance(response, SlotSuggestionResponse):
+            return "No time specified — send as a single message for slot suggestions"
+        if isinstance(response, ConflictPromptResponse):
+            return f"Conflict with: {', '.join(response.conflicting_summaries)}"
+        return response.message
+
+    # ------------------------------------------------------------------
     # Internal: single-action execution
     # ------------------------------------------------------------------
 
@@ -634,62 +811,7 @@ class ActionService:
         )
 
         if isinstance(parsed, ParsedEvent):
-            # --- Contact resolution ---
-            if parsed.mentioned_contacts:
-                resolved, unresolved = self._resolve_contacts(
-                    parsed.mentioned_contacts, parsed.guests,
-                )
-                if unresolved:
-                    first_unknown = unresolved[0]
-                    pending = PendingContactResolution(
-                        action_type="create",
-                        parsed_action_json=parsed.model_dump(),
-                        resolved_contacts=resolved,
-                        unresolved_contacts=unresolved,
-                        current_asking=first_unknown,
-                    )
-                    return ContactPromptResponse(
-                        kind=ResponseKind.CONTACT_PROMPT,
-                        message=f"I don't have an email for *{first_unknown}*. What's their email?",
-                        contact_name=first_unknown,
-                        pending=pending,
-                    )
-                # All contacts resolved — merge emails into guests
-                all_emails = list(resolved.values())
-                existing = parsed.guests
-                merged = list({e.lower(): e for e in existing + all_emails}.values())
-                parsed = parsed.model_copy(update={"guests": merged, "mentioned_contacts": []})
-
-            # --- Conflict check ---
-            conflict = await check_conflict(
-                self._calendar, parsed.date, parsed.time, parsed.duration_minutes,
-            )
-            if conflict.has_conflict:
-                return self._build_conflict_response(
-                    conflict, parsed.time,
-                    PendingEvent(
-                        pending_type="create",
-                        parsed_event_json=parsed.model_dump(),
-                    ),
-                )
-
-            try:
-                created = await self._calendar.add_event(parsed)
-                link = created.get("htmlLink", "")
-                return SuccessResponse(
-                    kind=ResponseKind.SUCCESS,
-                    message=f"\u2705 Event created: *{parsed.event}* on {parsed.date} at {parsed.time}",
-                    event=EventInfo(
-                        summary=parsed.event, date=parsed.date,
-                        time=parsed.time, link=link,
-                    ),
-                )
-            except CalendarError as exc:
-                logger.error("Calendar write error: %s", exc)
-                return ErrorResponse(
-                    kind=ResponseKind.ERROR,
-                    message="I parsed your event but couldn't save it to Google Calendar. Please try again later.",
-                )
+            return await self._run_create_pipeline(parsed)
 
         elif isinstance(parsed, CancelEvent):
             try:
@@ -990,49 +1112,8 @@ class ActionService:
         other_results_map: dict[int, ActionResult] = {}
         for idx, action in other_actions:
             if isinstance(action, ParsedEvent):
-                # In batch mode: auto-resolve known contacts, skip unknown
-                if action.mentioned_contacts:
-                    resolved, unresolved = self._resolve_contacts(
-                        action.mentioned_contacts, action.guests,
-                    )
-                    if unresolved:
-                        names = ", ".join(unresolved)
-                        other_results_map[idx] = ActionResult(
-                            action_type="create",
-                            summary=action.event,
-                            success=False,
-                            error_message=f"Unknown contact: {names}",
-                        )
-                        continue
-                    all_emails = list(resolved.values())
-                    existing = action.guests
-                    merged = list({e.lower(): e for e in existing + all_emails}.values())
-                    action = action.model_copy(update={"guests": merged, "mentioned_contacts": []})
-
-                try:
-                    conflict = await check_conflict(
-                        self._calendar, action.date, action.time, action.duration_minutes,
-                    )
-                    if conflict.has_conflict:
-                        clashing = ", ".join(
-                            ev.get("summary", "(no title)") for ev in conflict.conflicting_events
-                        )
-                        other_results_map[idx] = ActionResult(
-                            action_type="create",
-                            summary=action.event,
-                            success=False,
-                            error_message=f"Conflict with: {clashing}",
-                        )
-                        continue
-                    await self._calendar.add_event(action)
-                    other_results_map[idx] = ActionResult(
-                        action_type="create", summary=action.event, success=True,
-                    )
-                except CalendarError as exc:
-                    other_results_map[idx] = ActionResult(
-                        action_type="create", summary=action.event, success=False,
-                        error_message=str(exc),
-                    )
+                other_results_map[idx] = await self._run_create_pipeline_batch(action)
+                continue
             elif isinstance(action, RescheduleEvent):
                 try:
                     all_events = await self._calendar.find_events(target_date=action.original_date)
@@ -1229,4 +1310,80 @@ class ActionService:
             options=options,
             conflicting_summaries=clashing,
             pending=pending,
+        )
+
+    # ------------------------------------------------------------------
+    # Public: slot selection
+    # ------------------------------------------------------------------
+
+    async def select_slot(self, pending: PendingEvent, selected_time: str) -> ServiceResponse:
+        """Create an event at the user-selected time slot.
+
+        Re-checks for conflicts before creating (handles stale data and
+        user-typed times that weren't in the suggested list).
+        """
+        from src.core.conflict_checker import check_conflict
+
+        if pending.parsed_event_json:
+            conflict = await check_conflict(
+                self._calendar,
+                pending.parsed_event_json["date"],
+                selected_time,
+                pending.parsed_event_json.get("duration_minutes", 60),
+            )
+            if conflict.has_conflict:
+                clashing = ", ".join(
+                    ev.get("summary", "(no title)") for ev in conflict.conflicting_events
+                )
+                return ErrorResponse(
+                    kind=ResponseKind.ERROR,
+                    message=f"Sorry, {selected_time} conflicts with: {clashing}. Please pick another time.",
+                )
+
+        return await self._execute_pending_event(pending, selected_time)
+
+    # ------------------------------------------------------------------
+    # Internal: suggest slots for missing time
+    # ------------------------------------------------------------------
+
+    async def _suggest_slots(self, parsed: object) -> ServiceResponse:
+        """Suggest free time slots when a create request has no time specified."""
+        from src.core.conflict_checker import get_free_slots
+        from src.core.parser import ParsedEvent
+
+        if not isinstance(parsed, ParsedEvent):
+            return ErrorResponse(
+                kind=ResponseKind.ERROR,
+                message="Internal error: expected ParsedEvent for slot suggestion.",
+            )
+
+        result = await get_free_slots(
+            self._calendar, parsed.date, parsed.duration_minutes,
+        )
+
+        if not result.suggested:
+            return ErrorResponse(
+                kind=ResponseKind.ERROR,
+                message=f"No available slots on {parsed.date} for a {parsed.duration_minutes}-minute event.",
+            )
+
+        slot_options = [SlotOption(time=t, label=t) for t in result.suggested]
+
+        with_guests = ""
+        if parsed.guests:
+            with_guests = f" with {', '.join(parsed.guests)}"
+
+        return SlotSuggestionResponse(
+            kind=ResponseKind.SLOT_SUGGESTION,
+            message=(
+                f"I found some available times for *{parsed.event}*{with_guests} on {parsed.date}. "
+                f"Pick one, or type any time that works for you:"
+            ),
+            slots=slot_options,
+            pending=PendingEvent(
+                pending_type="create",
+                parsed_event_json=parsed.model_dump(),
+            ),
+            is_flexible=True,
+            all_free_slots=result.all_available,
         )
