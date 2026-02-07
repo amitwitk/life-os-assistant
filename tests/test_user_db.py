@@ -76,6 +76,26 @@ class TestUserDBListUsers:
         assert dana.invited_by == 12345
 
 
+class TestUserDBHomeAddress:
+    def test_home_address_default_none(self, user_db):
+        user_db.add_user(12345, "Amit", is_admin=True)
+        user = user_db.get_user(12345)
+        assert user.home_address is None
+
+    def test_set_home_address(self, user_db):
+        user_db.add_user(12345, "Amit", is_admin=True)
+        user_db.set_home_address(12345, "123 Main St, Tel Aviv")
+        user = user_db.get_user(12345)
+        assert user.home_address == "123 Main St, Tel Aviv"
+
+    def test_update_home_address(self, user_db):
+        user_db.add_user(12345, "Amit", is_admin=True)
+        user_db.set_home_address(12345, "Old Address")
+        user_db.set_home_address(12345, "New Address")
+        user = user_db.get_user(12345)
+        assert user.home_address == "New Address"
+
+
 class TestUserDBBackfill:
     def test_backfill_user_id(self, tmp_path):
         """Backfill assigns orphan chores/contacts to a user."""

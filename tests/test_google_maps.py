@@ -1,9 +1,14 @@
-"""Tests for src.integrations.google_maps — Places API enrichment."""
+"""Tests for src.integrations.google_maps — Places API enrichment and travel time."""
 
 import pytest
 from unittest.mock import AsyncMock, patch, MagicMock
 
-from src.integrations.google_maps import enrich_location, EnrichedLocation
+from src.integrations.google_maps import (
+    enrich_location,
+    EnrichedLocation,
+    get_travel_time,
+    TravelTimeResult,
+)
 
 
 class TestEnrichLocation:
@@ -145,3 +150,139 @@ class TestEnrichLocation:
         headers = call_kwargs.kwargs.get("headers") or call_kwargs[1].get("headers")
         assert headers["X-Goog-Api-Key"] == "my-api-key"
         assert "displayName" in headers["X-Goog-FieldMask"]
+
+
+class TestGetTravelTime:
+    @pytest.mark.asyncio
+    async def test_successful_travel_time(self):
+        """A successful Distance Matrix response returns TravelTimeResult."""
+        mock_resp = MagicMock()
+        mock_resp.json.return_value = {
+            "status": "OK",
+            "rows": [
+                {
+                    "elements": [
+                        {
+                            "status": "OK",
+                            "duration": {"value": 1800, "text": "30 mins"},
+                            "distance": {"value": 25000, "text": "25 km"},
+                        }
+                    ]
+                }
+            ],
+        }
+        mock_resp.raise_for_status = MagicMock()
+
+        mock_client = AsyncMock()
+        mock_client.__aenter__ = AsyncMock(return_value=mock_client)
+        mock_client.__aexit__ = AsyncMock(return_value=False)
+        mock_client.get = AsyncMock(return_value=mock_resp)
+
+        with patch("src.integrations.google_maps.httpx.AsyncClient", return_value=mock_client):
+            result = await get_travel_time("Home", "Office", "fake-key")
+
+        assert result is not None
+        assert result.duration_minutes == 30
+        assert result.duration_text == "30 mins"
+        assert result.distance_text == "25 km"
+
+    @pytest.mark.asyncio
+    async def test_rounds_up_duration(self):
+        """Duration in seconds is rounded up to minutes."""
+        mock_resp = MagicMock()
+        mock_resp.json.return_value = {
+            "status": "OK",
+            "rows": [
+                {
+                    "elements": [
+                        {
+                            "status": "OK",
+                            "duration": {"value": 1801, "text": "30 mins"},
+                            "distance": {"value": 25000, "text": "25 km"},
+                        }
+                    ]
+                }
+            ],
+        }
+        mock_resp.raise_for_status = MagicMock()
+
+        mock_client = AsyncMock()
+        mock_client.__aenter__ = AsyncMock(return_value=mock_client)
+        mock_client.__aexit__ = AsyncMock(return_value=False)
+        mock_client.get = AsyncMock(return_value=mock_resp)
+
+        with patch("src.integrations.google_maps.httpx.AsyncClient", return_value=mock_client):
+            result = await get_travel_time("Home", "Office", "fake-key")
+
+        assert result.duration_minutes == 31
+
+    @pytest.mark.asyncio
+    async def test_empty_origin_returns_none(self):
+        result = await get_travel_time("", "Office", "fake-key")
+        assert result is None
+
+    @pytest.mark.asyncio
+    async def test_empty_destination_returns_none(self):
+        result = await get_travel_time("Home", "", "fake-key")
+        assert result is None
+
+    @pytest.mark.asyncio
+    async def test_empty_api_key_returns_none(self):
+        result = await get_travel_time("Home", "Office", "")
+        assert result is None
+
+    @pytest.mark.asyncio
+    async def test_api_error_returns_none(self):
+        """HTTP error gracefully returns None."""
+        mock_client = AsyncMock()
+        mock_client.__aenter__ = AsyncMock(return_value=mock_client)
+        mock_client.__aexit__ = AsyncMock(return_value=False)
+        mock_client.get = AsyncMock(side_effect=Exception("Connection timeout"))
+
+        with patch("src.integrations.google_maps.httpx.AsyncClient", return_value=mock_client):
+            result = await get_travel_time("Home", "Office", "fake-key")
+
+        assert result is None
+
+    @pytest.mark.asyncio
+    async def test_non_ok_status_returns_none(self):
+        """Non-OK top-level status returns None."""
+        mock_resp = MagicMock()
+        mock_resp.json.return_value = {"status": "REQUEST_DENIED"}
+        mock_resp.raise_for_status = MagicMock()
+
+        mock_client = AsyncMock()
+        mock_client.__aenter__ = AsyncMock(return_value=mock_client)
+        mock_client.__aexit__ = AsyncMock(return_value=False)
+        mock_client.get = AsyncMock(return_value=mock_resp)
+
+        with patch("src.integrations.google_maps.httpx.AsyncClient", return_value=mock_client):
+            result = await get_travel_time("Home", "Office", "fake-key")
+
+        assert result is None
+
+    @pytest.mark.asyncio
+    async def test_element_not_found_returns_none(self):
+        """Element-level NOT_FOUND status returns None."""
+        mock_resp = MagicMock()
+        mock_resp.json.return_value = {
+            "status": "OK",
+            "rows": [
+                {
+                    "elements": [
+                        {"status": "NOT_FOUND"}
+                    ]
+                }
+            ],
+        }
+        mock_resp.raise_for_status = MagicMock()
+
+        mock_client = AsyncMock()
+        mock_client.__aenter__ = AsyncMock(return_value=mock_client)
+        mock_client.__aexit__ = AsyncMock(return_value=False)
+        mock_client.get = AsyncMock(return_value=mock_resp)
+
+        with patch("src.integrations.google_maps.httpx.AsyncClient", return_value=mock_client):
+            result = await get_travel_time("Nowhere", "Office", "fake-key")
+
+        assert result is None

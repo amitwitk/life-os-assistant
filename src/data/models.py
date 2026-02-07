@@ -20,6 +20,7 @@ class User:
     calendar_token_json: str | None = None
     onboarded: bool = False
     invited_by: int | None = None
+    home_address: str | None = None
     is_admin: bool = False
     created_at: str = ""
 
