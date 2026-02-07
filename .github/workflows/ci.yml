@@ -7,7 +7,7 @@ on:
     branches: [main, master]
 
 jobs:
-  test:
+  test-modules:
     runs-on: ubuntu-latest
 
     strategy:
@@ -50,3 +50,15 @@ jobs:
 
       - name: Run tests — ${{ matrix.module }}
         run: pytest tests/${{ matrix.module }}.py -v
+
+  # Gate job for branch protection — requires all matrix jobs to pass
+  test:
+    if: always()
+    needs: [test-modules]
+    runs-on: ubuntu-latest
+    steps:
+      - run: |
+          if [ "${{ needs.test-modules.result }}" != "success" ]; then
+            echo "One or more test modules failed"
+            exit 1
+          fi
