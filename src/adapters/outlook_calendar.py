@@ -247,6 +247,71 @@ class OutlookCalendarAdapter:
             logger.error("Outlook API error (add_guests): %s", exc)
             raise CalendarError(f"Failed to add guests: {exc}") from exc
 
+    async def update_event_fields(self, event_id: str, **fields: object) -> dict:
+        try:
+            client = get_graph_client()
+            existing = await client.me.events.by_event_id(event_id).get()
+
+            patch_kwargs: dict = {}
+
+            if "location" in fields:
+                patch_kwargs["location"] = Location(display_name=fields["location"])
+            if "description" in fields:
+                patch_kwargs["body"] = ItemBody(
+                    content=fields["description"], content_type=BodyType.Text,
+                )
+            if "time" in fields:
+                if existing.start and existing.end and existing.start.date_time and existing.end.date_time:
+                    orig_start = datetime.fromisoformat(existing.start.date_time)
+                    orig_end = datetime.fromisoformat(existing.end.date_time)
+                    duration = orig_end - orig_start
+                else:
+                    orig_start = datetime.now()
+                    duration = timedelta(hours=1)
+                new_date = orig_start.strftime("%Y-%m-%d")
+                new_start = datetime.strptime(f"{new_date} {fields['time']}", "%Y-%m-%d %H:%M")
+                new_end = new_start + duration
+                patch_kwargs["start"] = DateTimeTimeZone(
+                    date_time=new_start.strftime("%Y-%m-%dT%H:%M:%S"),
+                    time_zone=settings.TIMEZONE,
+                )
+                patch_kwargs["end"] = DateTimeTimeZone(
+                    date_time=new_end.strftime("%Y-%m-%dT%H:%M:%S"),
+                    time_zone=settings.TIMEZONE,
+                )
+            if "add_guests" in fields or "remove_guests" in fields:
+                current_attendees = list(existing.attendees or [])
+                existing_emails = {
+                    a.email_address.address
+                    for a in current_attendees
+                    if a.email_address and a.email_address.address
+                }
+                if "remove_guests" in fields:
+                    remove_set = set(fields["remove_guests"])
+                    current_attendees = [
+                        a for a in current_attendees
+                        if not (a.email_address and a.email_address.address in remove_set)
+                    ]
+                    existing_emails -= remove_set
+                if "add_guests" in fields:
+                    for g in fields["add_guests"]:
+                        if g not in existing_emails:
+                            current_attendees.append(
+                                Attendee(
+                                    email_address=EmailAddress(address=g),
+                                    type=AttendeeType.Required,
+                                )
+                            )
+                patch_kwargs["attendees"] = current_attendees
+
+            patch_event = Event(**patch_kwargs)
+            updated = await client.me.events.by_event_id(event_id).patch(patch_event)
+            logger.info("Updated fields %s on Outlook event %s", list(fields.keys()), event_id)
+            return _normalize_event(updated)
+        except Exception as exc:
+            logger.error("Outlook API error (update_event_fields): %s", exc)
+            raise CalendarError(f"Failed to update event fields: {exc}") from exc
+
     async def add_recurring_event(
         self,
         summary: str,

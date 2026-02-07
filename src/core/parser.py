@@ -153,7 +153,49 @@ class AddGuests(BaseModel):
         return f"add-guests to '{self.event_summary}' on {self.date}: {self.guests}"
 
 
-ParserResponse = ParsedEvent | CancelEvent | RescheduleEvent | QueryEvents | CancelAllExcept | AddGuests
+class ModifyEvent(BaseModel):
+    """Modify a recently created/rescheduled event.
+
+    JSON example:
+    {
+        "intent": "modify",
+        "add_location": "Blue Bottle Coffee",
+        "add_guests": [],
+        "mentioned_contacts": ["Shon"],
+        "new_time": "",
+        "new_description": ""
+    }
+    """
+    intent: str = Field(default="modify", description="Action type — always 'modify'")
+    add_location: str = Field(default="", description="Location to set on the event")
+    add_guests: list[str] = Field(default_factory=list, description="Email addresses to add as guests")
+    remove_guests: list[str] = Field(default_factory=list, description="Email addresses to remove")
+    mentioned_contacts: list[str] = Field(default_factory=list, description="Person names to resolve via contacts DB")
+    new_time: str = Field(default="", description="New time in HH:MM 24h format")
+    new_description: str = Field(default="", description="Description to set or append")
+    # Bot-injected context (hidden from LLM prompt)
+    event_id: str = Field(default="", json_schema_extra={"prompt_hidden": True})
+    event_summary: str = Field(default="", json_schema_extra={"prompt_hidden": True})
+    event_date: str = Field(default="", json_schema_extra={"prompt_hidden": True})
+    event_time: str = Field(default="", json_schema_extra={"prompt_hidden": True})
+
+    @property
+    def log_summary(self) -> str:
+        parts = []
+        if self.add_location:
+            parts.append(f"location={self.add_location}")
+        if self.add_guests:
+            parts.append(f"guests+={self.add_guests}")
+        if self.remove_guests:
+            parts.append(f"guests-={self.remove_guests}")
+        if self.new_time:
+            parts.append(f"time={self.new_time}")
+        if self.new_description:
+            parts.append(f"description updated")
+        return f"modify event: {', '.join(parts) or 'no changes'}"
+
+
+ParserResponse = ParsedEvent | CancelEvent | RescheduleEvent | QueryEvents | CancelAllExcept | AddGuests | ModifyEvent
 
 # ---------------------------------------------------------------------------
 # Intent registry — maps intent string to model class
@@ -166,6 +208,7 @@ INTENT_REGISTRY: dict[str, type[BaseModel]] = {
     "query": QueryEvents,
     "cancel_all_except": CancelAllExcept,
     "add_guests": AddGuests,
+    "modify": ModifyEvent,
 }
 
 
@@ -180,6 +223,7 @@ _INTENT_LABELS: dict[str, str] = {
     "query": "Query Events",
     "cancel_all_except": "Cancel All Except",
     "add_guests": "Add Guests",
+    "modify": "Modify Last Event",
 }
 
 _INTENT_TRIGGERS: dict[str, str] = {
@@ -189,6 +233,7 @@ _INTENT_TRIGGERS: dict[str, str] = {
     "query": 'If the user\'s message is asking about their schedule, what meetings they have, what\'s planned, etc. — keywords like "what meetings", "what do I have", "show me", "מה יש לי", "מה התוכניות"',
     "cancel_all_except": 'If the user wants to cancel ALL events on a date EXCEPT specific ones (e.g., "cancel everything today except the padel game")',
     "add_guests": 'If the user wants to add guests/invitees to an EXISTING event (e.g., "Add dan@email.com to the meeting with Dan tomorrow")',
+    "modify": 'If the user wants to modify/update their LAST created or rescheduled event — e.g., "add location: ...", "also invite ...", "change time to ...", "add a description: ..."',
 }
 
 _BEHAVIORAL_RULES: dict[str, list[str]] = {
@@ -208,6 +253,11 @@ _BEHAVIORAL_RULES: dict[str, list[str]] = {
     ],
     "add_guests": [
         "Only use this when the user explicitly asks to add guests to an EXISTING event. If they're creating a new event with guests, use Function 1 with the \"guests\" field instead.",
+    ],
+    "modify": [
+        "Only use this intent when the user clearly refers to modifying a recently discussed event, not creating a new one.",
+        'The bot will inject event context (event_id, event_summary, event_date, event_time) — do NOT include these fields in the JSON.',
+        '"mentioned_contacts" = names to resolve. "add_guests" = email addresses.',
     ],
 }
 

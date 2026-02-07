@@ -5,7 +5,7 @@ Core modules depend on this protocol, never on a specific provider.
 
 from __future__ import annotations
 
-from typing import Protocol
+from typing import Any, Protocol
 
 from src.core.parser import ParsedEvent
 
@@ -46,4 +46,8 @@ class CalendarPort(Protocol):
 
     async def add_guests(
         self, event_id: str, guests: list[str]
+    ) -> dict: ...
+
+    async def update_event_fields(
+        self, event_id: str, **fields: Any
     ) -> dict: ...

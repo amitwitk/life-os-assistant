@@ -52,6 +52,7 @@ class EventInfo:
     link: str = ""
     location: str = ""
     maps_url: str = ""
+    event_id: str = ""
 
 
 @dataclass
@@ -181,12 +182,19 @@ class ActionService:
     # Public: process free-text
     # ------------------------------------------------------------------
 
-    async def process_text(self, text: str) -> ServiceResponse:
+    async def process_text(
+        self, text: str, last_event_context: dict | None = None,
+    ) -> ServiceResponse:
         """Parse free text via LLM and execute calendar actions.
+
+        Args:
+            text: User's free-text message.
+            last_event_context: Optional dict with keys event_id, event_summary,
+                event_date, event_time — injected into ModifyEvent actions.
 
         Returns a ServiceResponse subclass describing the outcome.
         """
-        from src.core.parser import parse_message
+        from src.core.parser import ModifyEvent, parse_message
 
         try:
             actions = await parse_message(text)
@@ -207,6 +215,12 @@ class ActionService:
                     "'Reschedule my meeting with Dan tomorrow to 15:00'."
                 ),
             )
+
+        # Inject last event context into ModifyEvent actions
+        if last_event_context:
+            for i, action in enumerate(actions):
+                if isinstance(action, ModifyEvent):
+                    actions[i] = action.model_copy(update=last_event_context)
 
         if len(actions) == 1:
             return await self._execute_single_action(actions[0])
@@ -332,6 +346,7 @@ class ActionService:
                         summary=parsed.event, date=parsed.date,
                         time=time_to_use, link=link,
                         location=parsed.location, maps_url=parsed.maps_url,
+                        event_id=created.get("id", ""),
                     ),
                 )
             elif pending.pending_type == "reschedule":
@@ -346,6 +361,7 @@ class ActionService:
                     event=EventInfo(
                         summary=summary, date=pending.date,
                         time=time_to_use, link=link,
+                        event_id=updated.get("id", pending.event_id or ""),
                     ),
                 )
             else:
@@ -639,6 +655,16 @@ class ActionService:
 
         # All resolved — rebuild the parsed action with guests and re-execute
         all_emails = list(pending.resolved_contacts.values())
+
+        if pending.action_type == "modify":
+            from src.core.parser import ModifyEvent
+            existing_guests = pending.parsed_action_json.get("add_guests", [])
+            merged = list({e.lower(): e for e in existing_guests + all_emails}.values())
+            pending.parsed_action_json["add_guests"] = merged
+            pending.parsed_action_json["mentioned_contacts"] = []
+            parsed = ModifyEvent(**pending.parsed_action_json)
+            return await self._execute_single_action(parsed)
+
         existing_guests = pending.parsed_action_json.get("guests", [])
         merged = list({e.lower(): e for e in existing_guests + all_emails}.values())
         pending.parsed_action_json["guests"] = merged
@@ -778,6 +804,7 @@ class ActionService:
                     summary=parsed.event, date=parsed.date,
                     time=parsed.time, link=link,
                     location=parsed.location, maps_url=parsed.maps_url,
+                    event_id=created.get("id", ""),
                 ),
             )
         except CalendarError as exc:
@@ -843,6 +870,116 @@ class ActionService:
         return response.message
 
     # ------------------------------------------------------------------
+    # Internal: modify last event
+    # ------------------------------------------------------------------
+
+    async def _execute_modify(self, parsed: object) -> ServiceResponse:
+        """Execute a modify-last-event action."""
+        from src.core.parser import ModifyEvent, ParsedEvent
+
+        if not isinstance(parsed, ModifyEvent):
+            return ErrorResponse(
+                kind=ResponseKind.ERROR,
+                message="Internal error: expected ModifyEvent.",
+            )
+
+        if not parsed.event_id:
+            return ErrorResponse(
+                kind=ResponseKind.ERROR,
+                message="No recent event to modify. Create or reschedule an event first.",
+            )
+
+        fields: dict = {}
+        maps_url = ""
+
+        # Location enrichment (reuse _enrich_location via a temp ParsedEvent)
+        if parsed.add_location:
+            temp = ParsedEvent(
+                event="temp", date=parsed.event_date or "2000-01-01",
+                time=parsed.event_time or "12:00",
+                location=parsed.add_location,
+            )
+            enriched = await self._enrich_location(temp)
+            if isinstance(enriched, ParsedEvent):
+                fields["location"] = enriched.location
+                maps_url = enriched.maps_url
+            else:
+                fields["location"] = parsed.add_location
+
+        # Contact resolution
+        if parsed.mentioned_contacts:
+            resolved, unresolved = self._resolve_contacts(
+                parsed.mentioned_contacts, parsed.add_guests,
+            )
+            if unresolved:
+                first_unknown = unresolved[0]
+                pending = PendingContactResolution(
+                    action_type="modify",
+                    parsed_action_json=parsed.model_dump(),
+                    resolved_contacts=resolved,
+                    unresolved_contacts=unresolved,
+                    current_asking=first_unknown,
+                )
+                return ContactPromptResponse(
+                    kind=ResponseKind.CONTACT_PROMPT,
+                    message=f"I don't have an email for *{first_unknown}*. What's their email?",
+                    contact_name=first_unknown,
+                    pending=pending,
+                )
+            fields.setdefault("add_guests", []).extend(resolved.values())
+
+        if parsed.add_guests:
+            fields.setdefault("add_guests", []).extend(parsed.add_guests)
+        if parsed.remove_guests:
+            fields["remove_guests"] = parsed.remove_guests
+        if parsed.new_time:
+            fields["time"] = parsed.new_time
+        if parsed.new_description:
+            fields["description"] = parsed.new_description
+
+        if not fields:
+            return ErrorResponse(
+                kind=ResponseKind.ERROR,
+                message="I couldn't determine what to modify. Please be more specific.",
+            )
+
+        try:
+            updated = await self._calendar.update_event_fields(parsed.event_id, **fields)
+
+            parts: list[str] = []
+            if "location" in fields:
+                parts.append(f"location \u2192 {fields['location']}")
+            if "add_guests" in fields:
+                parts.append(f"added {', '.join(fields['add_guests'])}")
+            if "remove_guests" in fields:
+                parts.append(f"removed {', '.join(fields['remove_guests'])}")
+            if "time" in fields:
+                parts.append(f"time \u2192 {fields['time']}")
+            if "description" in fields:
+                parts.append("description updated")
+
+            msg = f"\u270f\ufe0f Updated *{parsed.event_summary}*: {', '.join(parts)}"
+            return SuccessResponse(
+                kind=ResponseKind.SUCCESS,
+                message=msg,
+                event=EventInfo(
+                    event_id=updated.get("id", parsed.event_id),
+                    summary=parsed.event_summary,
+                    date=parsed.event_date,
+                    time=fields.get("time", parsed.event_time),
+                    link=updated.get("htmlLink", ""),
+                    location=fields.get("location", ""),
+                    maps_url=maps_url,
+                ),
+            )
+        except CalendarError as exc:
+            logger.error("Calendar update_event_fields error: %s", exc)
+            return ErrorResponse(
+                kind=ResponseKind.ERROR,
+                message="Couldn't update the event. Please try again.",
+            )
+
+    # ------------------------------------------------------------------
     # Internal: single-action execution
     # ------------------------------------------------------------------
 
@@ -850,11 +987,14 @@ class ActionService:
         """Execute a single parsed action with full interactive flow."""
         from src.core.conflict_checker import check_conflict, extract_event_duration_minutes
         from src.core.parser import (
-            AddGuests, CancelAllExcept, CancelEvent, ParsedEvent, QueryEvents,
-            RescheduleEvent, batch_exclude_events, match_event,
+            AddGuests, CancelAllExcept, CancelEvent, ModifyEvent, ParsedEvent,
+            QueryEvents, RescheduleEvent, batch_exclude_events, match_event,
         )
 
-        if isinstance(parsed, ParsedEvent):
+        if isinstance(parsed, ModifyEvent):
+            return await self._execute_modify(parsed)
+
+        elif isinstance(parsed, ParsedEvent):
             return await self._run_create_pipeline(parsed)
 
         elif isinstance(parsed, CancelEvent):
@@ -941,6 +1081,7 @@ class ActionService:
                     event=EventInfo(
                         summary=summary, date=parsed.original_date,
                         time=parsed.new_time, link=link,
+                        event_id=updated.get("id", matched.get("id", "")),
                     ),
                 )
             except CalendarError as exc:

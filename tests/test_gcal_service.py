@@ -286,3 +286,90 @@ class TestAddGuests:
             from src.integrations.gcal_service import add_guests
             with pytest.raises(CalendarError):
                 await add_guests("evt1", ["a@test.com"])
+
+
+# ---------------------------------------------------------------------------
+# Tests for update_event_fields
+# ---------------------------------------------------------------------------
+
+
+class TestUpdateEventFields:
+    @pytest.mark.asyncio
+    async def test_update_location(self):
+        mock_svc = _mock_service(execute_return={
+            "id": "evt1", "start": {"dateTime": "2026-02-08T14:00:00"},
+            "end": {"dateTime": "2026-02-08T15:00:00"},
+        })
+        with patch(_PATCH_GCS, return_value=mock_svc):
+            adapter = GoogleCalendarAdapter()
+            result = await adapter.update_event_fields("evt1", location="Blue Bottle")
+        assert result["id"] == "evt1"
+        call_body = mock_svc.events.return_value.update.call_args[1]["body"]
+        assert call_body["location"] == "Blue Bottle"
+
+    @pytest.mark.asyncio
+    async def test_update_description(self):
+        mock_svc = _mock_service(execute_return={
+            "id": "evt1", "start": {"dateTime": "2026-02-08T14:00:00"},
+            "end": {"dateTime": "2026-02-08T15:00:00"},
+        })
+        with patch(_PATCH_GCS, return_value=mock_svc):
+            adapter = GoogleCalendarAdapter()
+            result = await adapter.update_event_fields("evt1", description="Updated notes")
+        call_body = mock_svc.events.return_value.update.call_args[1]["body"]
+        assert call_body["description"] == "Updated notes"
+
+    @pytest.mark.asyncio
+    async def test_update_add_and_remove_guests(self):
+        mock_svc = _mock_service(execute_return={
+            "id": "evt1",
+            "start": {"dateTime": "2026-02-08T14:00:00"},
+            "end": {"dateTime": "2026-02-08T15:00:00"},
+            "attendees": [{"email": "a@test.com"}, {"email": "b@test.com"}],
+        })
+        # get returns the same event
+        mock_svc.events.return_value.get.return_value.execute.return_value = {
+            "id": "evt1",
+            "start": {"dateTime": "2026-02-08T14:00:00"},
+            "end": {"dateTime": "2026-02-08T15:00:00"},
+            "attendees": [{"email": "a@test.com"}, {"email": "b@test.com"}],
+        }
+        with patch(_PATCH_GCS, return_value=mock_svc):
+            adapter = GoogleCalendarAdapter()
+            await adapter.update_event_fields(
+                "evt1", add_guests=["c@test.com"], remove_guests=["a@test.com"],
+            )
+        call_body = mock_svc.events.return_value.update.call_args[1]["body"]
+        emails = [a["email"] for a in call_body["attendees"]]
+        assert "c@test.com" in emails
+        assert "a@test.com" not in emails
+        assert "b@test.com" in emails
+
+    @pytest.mark.asyncio
+    async def test_update_time_preserves_duration(self):
+        mock_svc = _mock_service(execute_return={
+            "id": "evt1",
+            "start": {"dateTime": "2026-02-08T14:00:00"},
+            "end": {"dateTime": "2026-02-08T15:30:00"},
+        })
+        mock_svc.events.return_value.get.return_value.execute.return_value = {
+            "id": "evt1",
+            "start": {"dateTime": "2026-02-08T14:00:00"},
+            "end": {"dateTime": "2026-02-08T15:30:00"},
+        }
+        with patch(_PATCH_GCS, return_value=mock_svc):
+            adapter = GoogleCalendarAdapter()
+            await adapter.update_event_fields("evt1", time="16:00")
+        call_body = mock_svc.events.return_value.update.call_args[1]["body"]
+        # Duration was 1.5h → new end should be 17:30
+        assert "16:00:00" in call_body["start"]["dateTime"]
+        assert "17:30:00" in call_body["end"]["dateTime"]
+
+    @pytest.mark.asyncio
+    async def test_update_failure_raises(self):
+        mock_svc = MagicMock()
+        mock_svc.events.return_value.get.return_value.execute.side_effect = Exception("API fail")
+        with patch(_PATCH_GCS, return_value=mock_svc):
+            adapter = GoogleCalendarAdapter()
+            with pytest.raises(CalendarError):
+                await adapter.update_event_fields("evt1", location="Fail")

@@ -133,6 +133,14 @@ async def _render_response(
         await update.message.reply_text(response.message, parse_mode="Markdown")
 
     elif isinstance(response, SuccessResponse):
+        # Store last event context for modify flow
+        if response.event and response.event.event_id:
+            context.user_data["last_event_context"] = {
+                "event_id": response.event.event_id,
+                "event_summary": response.event.summary,
+                "event_date": response.event.date,
+                "event_time": response.event.time,
+            }
         msg = response.message
         if response.event and response.event.maps_url:
             msg += f"\n[Open in Google Maps]({response.event.maps_url})"
@@ -169,7 +177,9 @@ async def _process_text(
         return
 
     service: ActionService = context.bot_data["action_service"]
-    response = await service.process_text(text)
+    # Pop last event context — _render_response will re-set it on success
+    last_ctx = context.user_data.pop("last_event_context", None)
+    response = await service.process_text(text, last_event_context=last_ctx)
     await _render_response(response, update, context)
 
 
@@ -213,6 +223,13 @@ async def _handle_conflict_callback(
 
     msg = response.message
     if isinstance(response, SuccessResponse) and response.event:
+        if response.event.event_id:
+            context.user_data["last_event_context"] = {
+                "event_id": response.event.event_id,
+                "event_summary": response.event.summary,
+                "event_date": response.event.date,
+                "event_time": response.event.time,
+            }
         if response.event.maps_url:
             msg += f"\n[Open in Google Maps]({response.event.maps_url})"
         if response.event.link:
@@ -237,6 +254,13 @@ async def _handle_custom_time(
     response = await service.resolve_conflict(pending, "custom", custom_time=text)
 
     if isinstance(response, SuccessResponse):
+        if response.event and response.event.event_id:
+            context.user_data["last_event_context"] = {
+                "event_id": response.event.event_id,
+                "event_summary": response.event.summary,
+                "event_date": response.event.date,
+                "event_time": response.event.time,
+            }
         msg = response.message
         if response.event and response.event.maps_url:
             msg += f"\n[Open in Google Maps]({response.event.maps_url})"
@@ -348,6 +372,13 @@ async def _handle_slot_callback(
 
     msg = response.message
     if isinstance(response, SuccessResponse) and response.event:
+        if response.event.event_id:
+            context.user_data["last_event_context"] = {
+                "event_id": response.event.event_id,
+                "event_summary": response.event.summary,
+                "event_date": response.event.date,
+                "event_time": response.event.time,
+            }
         if response.event.maps_url:
             msg += f"\n[Open in Google Maps]({response.event.maps_url})"
         if response.event.link:
@@ -403,6 +434,13 @@ async def _handle_slot_text_input(
 
     msg = response.message
     if isinstance(response, SuccessResponse) and response.event:
+        if response.event.event_id:
+            context.user_data["last_event_context"] = {
+                "event_id": response.event.event_id,
+                "event_summary": response.event.summary,
+                "event_date": response.event.date,
+                "event_time": response.event.time,
+            }
         if response.event.maps_url:
             msg += f"\n[Open in Google Maps]({response.event.maps_url})"
         if response.event.link:

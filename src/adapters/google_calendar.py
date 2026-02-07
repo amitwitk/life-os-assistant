@@ -217,6 +217,59 @@ class GoogleCalendarAdapter:
             logger.error("Failed to add guests to event %s: %s", event_id, exc)
             raise CalendarError(f"Failed to add guests: {exc}") from exc
 
+    async def update_event_fields(self, event_id: str, **fields: object) -> dict:
+        try:
+            service = get_calendar_service()
+            event = (
+                service.events()
+                .get(calendarId="primary", eventId=event_id)
+                .execute()
+            )
+
+            if "location" in fields:
+                event["location"] = fields["location"]
+            if "description" in fields:
+                event["description"] = fields["description"]
+            if "time" in fields:
+                # Recalculate start/end preserving duration and date
+                orig_start_str = event["start"].get("dateTime", event["start"].get("date"))
+                orig_end_str = event["end"].get("dateTime", event["end"].get("date"))
+                if "T" in orig_start_str and "T" in orig_end_str:
+                    orig_start = datetime.fromisoformat(orig_start_str)
+                    orig_end = datetime.fromisoformat(orig_end_str)
+                    duration = orig_end - orig_start
+                else:
+                    orig_start = datetime.fromisoformat(orig_start_str)
+                    duration = timedelta(hours=1)
+                new_date = orig_start.strftime("%Y-%m-%d")
+                new_start = datetime.strptime(f"{new_date} {fields['time']}", "%Y-%m-%d %H:%M")
+                new_end = new_start + duration
+                event["start"]["dateTime"] = new_start.isoformat()
+                event["end"]["dateTime"] = new_end.isoformat()
+            if "add_guests" in fields:
+                existing = event.get("attendees", [])
+                existing_emails = {a["email"] for a in existing}
+                for g in fields["add_guests"]:
+                    if g not in existing_emails:
+                        existing.append({"email": g})
+                event["attendees"] = existing
+            if "remove_guests" in fields:
+                event["attendees"] = [
+                    a for a in event.get("attendees", [])
+                    if a["email"] not in fields["remove_guests"]
+                ]
+
+            updated = (
+                service.events()
+                .update(calendarId="primary", eventId=event_id, body=event)
+                .execute()
+            )
+            logger.info("Updated fields %s on event %s", list(fields.keys()), event_id)
+            return updated
+        except Exception as exc:
+            logger.error("Failed to update event fields for %s: %s", event_id, exc)
+            raise CalendarError(f"Failed to update event fields: {exc}") from exc
+
     async def add_recurring_event(
         self,
         summary: str,
