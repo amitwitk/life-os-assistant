@@ -174,9 +174,15 @@ class ActionService:
     Returns structured response objects — never sends messages directly.
     """
 
-    def __init__(self, calendar: CalendarPort, contact_db: ContactDB | None = None) -> None:
+    def __init__(
+        self,
+        calendar: CalendarPort,
+        contact_db: ContactDB | None = None,
+        user_id: int | None = None,
+    ) -> None:
         self._calendar = calendar
         self._contact_db = contact_db
+        self._user_id = user_id
 
     # ------------------------------------------------------------------
     # Public: process free-text
@@ -491,6 +497,7 @@ class ActionService:
             duration_minutes=duration_minutes,
             preferred_time_start=preferred_time_start,
             preferred_time_end=preferred_time_end,
+            user_id=self._user_id,
         )
 
     async def create_chore_calendar_event(
@@ -575,7 +582,7 @@ class ActionService:
         from src.data.db import ChoreDB
 
         db = ChoreDB()
-        return db.list_all(active_only=active_only)
+        return db.list_all(active_only=active_only, user_id=self._user_id)
 
     def mark_chore_done(self, chore_id: int) -> Chore:
         """Mark a chore as done and advance next_due."""
@@ -604,7 +611,7 @@ class ActionService:
         existing_lower = {e.lower() for e in existing_guests}
 
         for name in mentioned_contacts:
-            contact = self._contact_db.find_by_name(name)
+            contact = self._contact_db.find_by_name(name, user_id=self._user_id)
             if contact and contact.email.lower() not in existing_lower:
                 resolved[name] = contact.email
             elif contact:
@@ -636,7 +643,7 @@ class ActionService:
 
         # Save contact to DB
         if self._contact_db:
-            self._contact_db.add_contact(pending.current_asking, email)
+            self._contact_db.add_contact(pending.current_asking, email, user_id=self._user_id)
 
         # Move from unresolved → resolved
         pending.resolved_contacts[pending.current_asking] = email

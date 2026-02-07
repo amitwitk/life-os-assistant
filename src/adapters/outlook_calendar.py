@@ -29,7 +29,6 @@ from msgraph.generated.users.item.calendar_view.calendar_view_request_builder im
 
 from src.config import settings
 from src.core.parser import ParsedEvent
-from src.integrations.ms_auth import get_graph_client
 from src.ports.calendar_port import CalendarError
 
 logger = logging.getLogger(__name__)
@@ -81,6 +80,15 @@ def _normalize_event(event: Event) -> dict:
 class OutlookCalendarAdapter:
     """Microsoft Outlook/365 implementation of CalendarPort."""
 
+    def __init__(self, token_json: str | None = None) -> None:
+        self._token_json = token_json
+
+    def _get_client(self):
+        """Get a Graph client using per-user or global credentials."""
+        from src.integrations.ms_auth import get_graph_client
+        # TODO: per-user token support for Outlook
+        return get_graph_client()
+
     async def add_event(self, parsed_event: ParsedEvent) -> dict:
         start_dt = datetime.strptime(
             f"{parsed_event.date} {parsed_event.time}", "%Y-%m-%d %H:%M"
@@ -117,7 +125,7 @@ class OutlookCalendarAdapter:
         )
 
         try:
-            client = get_graph_client()
+            client = self._get_client()
             created = await client.me.events.post(event)
             logger.info(
                 "Outlook event created: '%s' on %s",
@@ -139,7 +147,7 @@ class OutlookCalendarAdapter:
         time_max = f"{target_date}T23:59:59"
 
         try:
-            client = get_graph_client()
+            client = self._get_client()
             query_params = CalendarViewRequestBuilder.CalendarViewRequestBuilderGetQueryParameters(
                 start_date_time=time_min,
                 end_date_time=time_max,
@@ -174,7 +182,7 @@ class OutlookCalendarAdapter:
 
     async def delete_event(self, event_id: str) -> None:
         try:
-            client = get_graph_client()
+            client = self._get_client()
             await client.me.events.by_event_id(event_id).delete()
             logger.info("Outlook event %s deleted.", event_id)
         except Exception as exc:
@@ -185,7 +193,7 @@ class OutlookCalendarAdapter:
         self, event_id: str, new_date: str, new_time: str
     ) -> dict:
         try:
-            client = get_graph_client()
+            client = self._get_client()
             existing = await client.me.events.by_event_id(event_id).get()
 
             # Calculate duration from original event
@@ -221,7 +229,7 @@ class OutlookCalendarAdapter:
 
     async def add_guests(self, event_id: str, guests: list[str]) -> dict:
         try:
-            client = get_graph_client()
+            client = self._get_client()
             existing = await client.me.events.by_event_id(event_id).get()
 
             current_attendees = list(existing.attendees or [])
@@ -249,7 +257,7 @@ class OutlookCalendarAdapter:
 
     async def update_event_fields(self, event_id: str, **fields: object) -> dict:
         try:
-            client = get_graph_client()
+            client = self._get_client()
             existing = await client.me.events.by_event_id(event_id).get()
 
             patch_kwargs: dict = {}
@@ -348,7 +356,7 @@ class OutlookCalendarAdapter:
         )
 
         try:
-            client = get_graph_client()
+            client = self._get_client()
             created = await client.me.events.post(event)
             logger.info(
                 "Outlook recurring event created: '%s' starting %s %s–%s, "

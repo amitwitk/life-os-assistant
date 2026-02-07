@@ -37,3 +37,10 @@ def contact_db(tmp_path):
     """Return a ContactDB instance backed by a temp file."""
     from src.data.db import ContactDB
     return ContactDB(db_path=str(tmp_path / "test_contacts.db"))
+
+
+@pytest.fixture
+def user_db(tmp_path):
+    """Return a UserDB instance backed by a temp file."""
+    from src.data.db import UserDB
+    return UserDB(db_path=str(tmp_path / "test_users.db"))

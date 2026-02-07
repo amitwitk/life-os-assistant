@@ -56,29 +56,150 @@ logger = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
-# Security: silent-ignore decorator
+# Security: auth decorators
 # ---------------------------------------------------------------------------
 
 
-def authorized_only(
-    func: Callable[..., Coroutine[Any, Any, None]],
-) -> Callable[..., Coroutine[Any, Any, None]]:
-    """Decorator that silently ignores messages from unauthorized users.
+def _get_user_db(context: ContextTypes.DEFAULT_TYPE):
+    """Get the UserDB from bot_data."""
+    return context.bot_data.get("user_db")
 
-    Does NOT send any response to strangers — the bot must not reveal
-    its existence to unauthorized users.
+
+def registered_only(
+    func: Callable[..., Coroutine[Any, Any, Any]],
+) -> Callable[..., Coroutine[Any, Any, Any]]:
+    """Decorator that only allows registered and onboarded users.
+
+    Silently ignores unregistered users. Tells registered-but-not-onboarded
+    users to run /setup.
     """
 
     @wraps(func)
-    async def wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    async def wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Any:
         user = update.effective_user
-        if user is None or user.id not in settings.ALLOWED_USER_IDS:
-            uid = user.id if user else "unknown"
-            logger.warning("Unauthorized access attempt from user_id=%s", uid)
-            return  # Silent ignore
+        if user is None:
+            return None
+
+        user_db = _get_user_db(context)
+        if user_db is None:
+            # Fallback to legacy ALLOWED_USER_IDS if no user_db
+            if user.id not in settings.ALLOWED_USER_IDS:
+                logger.warning("Unauthorized access attempt from user_id=%s", user.id)
+                return None
+            return await func(update, context)
+
+        db_user = user_db.get_user(user.id)
+        if db_user is None:
+            logger.warning("Unregistered access attempt from user_id=%s", user.id)
+            return None
+        if not db_user.onboarded:
+            if update.message:
+                await update.message.reply_text(
+                    "You need to complete setup first. Run /setup to connect your calendar."
+                )
+            return None
         return await func(update, context)
 
     return wrapper
+
+
+def admin_only(
+    func: Callable[..., Coroutine[Any, Any, Any]],
+) -> Callable[..., Coroutine[Any, Any, Any]]:
+    """Decorator that only allows admin users."""
+
+    @wraps(func)
+    async def wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Any:
+        user = update.effective_user
+        if user is None:
+            return None
+
+        user_db = _get_user_db(context)
+        if user_db is None:
+            if user.id not in settings.ALLOWED_USER_IDS:
+                return None
+            return await func(update, context)
+
+        db_user = user_db.get_user(user.id)
+        if db_user is None or not db_user.is_admin:
+            logger.warning("Non-admin access attempt from user_id=%s", user.id)
+            return None
+        return await func(update, context)
+
+    return wrapper
+
+
+def registered_not_onboarded(
+    func: Callable[..., Coroutine[Any, Any, Any]],
+) -> Callable[..., Coroutine[Any, Any, Any]]:
+    """Decorator that allows registered users even if not onboarded.
+
+    Used for /setup and /start so users can complete onboarding.
+    """
+
+    @wraps(func)
+    async def wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Any:
+        user = update.effective_user
+        if user is None:
+            return None
+
+        user_db = _get_user_db(context)
+        if user_db is None:
+            if user.id not in settings.ALLOWED_USER_IDS:
+                return None
+            return await func(update, context)
+
+        if not user_db.is_registered(user.id):
+            logger.warning("Unregistered access attempt from user_id=%s", user.id)
+            return None
+        return await func(update, context)
+
+    return wrapper
+
+
+# Keep backward compat alias
+authorized_only = registered_only
+
+
+def _is_authorized_callback(user_id: int, context: ContextTypes.DEFAULT_TYPE) -> bool:
+    """Check if a user is authorized for callback queries."""
+    user_db = _get_user_db(context)
+    if user_db is None:
+        return user_id in settings.ALLOWED_USER_IDS
+    return user_db.is_registered(user_id)
+
+
+# ---------------------------------------------------------------------------
+# Per-user ActionService helper
+# ---------------------------------------------------------------------------
+
+
+def _get_service(user_id: int, context: ContextTypes.DEFAULT_TYPE) -> ActionService:
+    """Get or create a per-user ActionService instance.
+
+    Caches the service in context.user_data to avoid recreating it
+    on every request. Falls back to the shared service from bot_data
+    if no UserDB is configured.
+    """
+    # Legacy mode: single shared service
+    user_db = context.bot_data.get("user_db")
+    if user_db is None:
+        return context.bot_data["action_service"]
+
+    cache_key = "action_service"
+    if cache_key in context.user_data:
+        return context.user_data[cache_key]
+
+    from src.adapters.calendar_factory import create_calendar_adapter
+    from src.data.db import ContactDB
+
+    db_user = user_db.get_user(user_id)
+    token_json = db_user.calendar_token_json if db_user else None
+    calendar = create_calendar_adapter(token_json=token_json)
+    contact_db = ContactDB()
+    service = ActionService(calendar, contact_db=contact_db, user_id=user_id)
+    context.user_data[cache_key] = service
+    return service
 
 
 # ---------------------------------------------------------------------------
@@ -176,7 +297,7 @@ async def _process_text(
         await _handle_slot_text_input(text, update, context)
         return
 
-    service: ActionService = context.bot_data["action_service"]
+    service = _get_service(update.effective_user.id, context)
     # Pop last event context — _render_response will re-set it on success
     last_ctx = context.user_data.pop("last_event_context", None)
     response = await service.process_text(text, last_event_context=last_ctx)
@@ -196,7 +317,7 @@ async def _handle_conflict_callback(
     await query.answer()
 
     user = query.from_user
-    if user is None or user.id not in settings.ALLOWED_USER_IDS:
+    if user is None or not _is_authorized_callback(user.id, context):
         return
 
     pending = context.user_data.get("pending_event")
@@ -218,7 +339,7 @@ async def _handle_conflict_callback(
         )
         return
 
-    service: ActionService = context.bot_data["action_service"]
+    service = _get_service(user.id, context)
     response = await service.resolve_conflict(pending, action)
 
     msg = response.message
@@ -250,7 +371,7 @@ async def _handle_custom_time(
         await update.message.reply_text("No pending event. Please start over.")
         return
 
-    service: ActionService = context.bot_data["action_service"]
+    service = _get_service(update.effective_user.id, context)
     response = await service.resolve_conflict(pending, "custom", custom_time=text)
 
     if isinstance(response, SuccessResponse):
@@ -289,7 +410,7 @@ async def _handle_contact_email(
         await update.message.reply_text("No pending contact resolution. Please start over.")
         return
 
-    service: ActionService = context.bot_data["action_service"]
+    service = _get_service(update.effective_user.id, context)
     response = await service.resolve_contact(pending, text.strip())
 
     if isinstance(response, ContactPromptResponse):
@@ -316,7 +437,7 @@ async def _handle_batch_cancel_callback(
     await query.answer()
 
     user = query.from_user
-    if user is None or user.id not in settings.ALLOWED_USER_IDS:
+    if user is None or not _is_authorized_callback(user.id, context):
         return
 
     action = query.data.split(":")[1]
@@ -331,7 +452,7 @@ async def _handle_batch_cancel_callback(
             await query.edit_message_text("No pending cancel found. Please try again.")
             return
 
-        service: ActionService = context.bot_data["action_service"]
+        service = _get_service(user.id, context)
         response = await service.confirm_batch_cancel(pending)
         await query.edit_message_text(response.message, parse_mode="Markdown")
 
@@ -349,7 +470,7 @@ async def _handle_slot_callback(
     await query.answer()
 
     user = query.from_user
-    if user is None or user.id not in settings.ALLOWED_USER_IDS:
+    if user is None or not _is_authorized_callback(user.id, context):
         return
 
     pending = context.user_data.get("pending_slot")
@@ -367,7 +488,7 @@ async def _handle_slot_callback(
         await query.edit_message_text("Event creation cancelled.")
         return
 
-    service: ActionService = context.bot_data["action_service"]
+    service = _get_service(user.id, context)
     response = await service.select_slot(pending, selected_time)
 
     msg = response.message
@@ -419,7 +540,7 @@ async def _handle_slot_text_input(
     if not time_match:
         # Not a time — user moved on. Clear slot state, process normally.
         _clear_slot_data(context)
-        service: ActionService = context.bot_data["action_service"]
+        service = _get_service(update.effective_user.id, context)
         response = await service.process_text(text)
         await _render_response(response, update, context)
         return
@@ -429,7 +550,7 @@ async def _handle_slot_text_input(
     if len(selected_time.split(":")[0]) == 1:
         selected_time = "0" + selected_time
 
-    service: ActionService = context.bot_data["action_service"]
+    service = _get_service(update.effective_user.id, context)
     response = await service.select_slot(pending, selected_time)
 
     msg = response.message
@@ -484,6 +605,9 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "/chores — List all active chores\n"
         "/done <id> — Mark a chore as done\n"
         "/deletechore <id> — Delete a chore and its calendar events\n"
+        "/setup — Connect your calendar\n"
+        "/invite <id> — Invite a new user (admin)\n"
+        "/users — List registered users (admin)\n"
         "/help — Show this message",
         parse_mode="Markdown",
     )
@@ -492,7 +616,7 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 @authorized_only
 async def cmd_today(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Handle /today — show today's calendar events."""
-    service: ActionService = context.bot_data["action_service"]
+    service = _get_service(update.effective_user.id, context)
     response = await service.get_today_events()
     await update.message.reply_text(response.message, parse_mode="Markdown")
 
@@ -654,7 +778,7 @@ async def addchore_weeks(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
     await update.message.reply_text("Finding the best time slot...")
 
-    service: ActionService = context.bot_data["action_service"]
+    service = _get_service(update.effective_user.id, context)
 
     try:
         slot = await service.find_chore_slot(
@@ -708,7 +832,7 @@ async def addchore_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     """Handle user confirmation — create DB entry and recurring calendar event."""
     from src.ports.calendar_port import CalendarError
 
-    service: ActionService = context.bot_data["action_service"]
+    service = _get_service(update.effective_user.id, context)
 
     answer = update.message.text.strip().lower()
     if answer not in ("yes", "y"):
@@ -794,7 +918,7 @@ def _clear_chore_data(context: ContextTypes.DEFAULT_TYPE) -> None:
 @authorized_only
 async def cmd_chores(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Handle /chores — list all active chores."""
-    service: ActionService = context.bot_data["action_service"]
+    service = _get_service(update.effective_user.id, context)
 
     try:
         chores = service.list_chores(active_only=True)
@@ -816,7 +940,7 @@ async def cmd_chores(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
 @authorized_only
 async def cmd_done(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Handle /done <id> — mark a chore as done."""
-    service: ActionService = context.bot_data["action_service"]
+    service = _get_service(update.effective_user.id, context)
 
     args = context.args
     if not args:
@@ -843,7 +967,7 @@ async def cmd_done(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 @authorized_only
 async def cmd_deletechore(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Handle /deletechore — show active chores as buttons to pick from."""
-    service: ActionService = context.bot_data["action_service"]
+    service = _get_service(update.effective_user.id, context)
 
     try:
         chores = service.list_chores(active_only=True)
@@ -874,12 +998,12 @@ async def _handle_deletechore_callback(
     await query.answer()
 
     user = query.from_user
-    if user is None or user.id not in settings.ALLOWED_USER_IDS:
+    if user is None or not _is_authorized_callback(user.id, context):
         return
 
     chore_id = int(query.data.split(":")[1])
 
-    service: ActionService = context.bot_data["action_service"]
+    service = _get_service(user.id, context)
     response = await service.delete_chore(chore_id)
     await query.edit_message_text(response.message, parse_mode="Markdown")
 
@@ -938,6 +1062,258 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
 
 # ---------------------------------------------------------------------------
+# Admin commands — /invite, /users
+# ---------------------------------------------------------------------------
+
+SETUP_WAITING_AUTH_CODE = 100
+
+
+@admin_only
+async def cmd_invite(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle /invite <telegram_user_id> [display_name] — register a new user."""
+    args = context.args
+    if not args:
+        await update.message.reply_text(
+            "Usage: /invite <telegram_user_id> [display_name]"
+        )
+        return
+
+    try:
+        new_user_id = int(args[0])
+    except ValueError:
+        await update.message.reply_text("Invalid user ID. Must be a number.")
+        return
+
+    display_name = " ".join(args[1:]) if len(args) > 1 else f"User {new_user_id}"
+    user_db = _get_user_db(context)
+    if user_db is None:
+        await update.message.reply_text("User management is not enabled.")
+        return
+
+    if user_db.is_registered(new_user_id):
+        await update.message.reply_text(f"User {new_user_id} is already registered.")
+        return
+
+    user_db.add_user(
+        telegram_user_id=new_user_id,
+        display_name=display_name,
+        invited_by=update.effective_user.id,
+        is_admin=False,
+    )
+    await update.message.reply_text(
+        f"Invited *{display_name}* (ID: `{new_user_id}`).\n"
+        "They can now start the bot and run /setup to connect their calendar.",
+        parse_mode="Markdown",
+    )
+
+
+@admin_only
+async def cmd_users(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle /users — list all registered users."""
+    user_db = _get_user_db(context)
+    if user_db is None:
+        await update.message.reply_text("User management is not enabled.")
+        return
+
+    users = user_db.list_users()
+    if not users:
+        await update.message.reply_text("No registered users.")
+        return
+
+    lines = ["*Registered users:*\n"]
+    for u in users:
+        status = "onboarded" if u.onboarded else "pending setup"
+        admin_tag = " (admin)" if u.is_admin else ""
+        lines.append(f"`{u.telegram_user_id}` — {u.display_name}{admin_tag} [{status}]")
+    await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
+
+
+# ---------------------------------------------------------------------------
+# Setup conversation — /setup (calendar onboarding)
+# ---------------------------------------------------------------------------
+
+
+@registered_not_onboarded
+async def cmd_setup(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Handle /setup — start calendar onboarding."""
+    user_db = _get_user_db(context)
+    if user_db is None:
+        await update.message.reply_text("User management is not enabled.")
+        return ConversationHandler.END
+
+    db_user = user_db.get_user(update.effective_user.id)
+    if db_user and db_user.onboarded:
+        await update.message.reply_text(
+            "You're already set up! Your calendar is connected.\n"
+            "To reconnect, an admin needs to reset your account."
+        )
+        return ConversationHandler.END
+
+    provider = settings.CALENDAR_PROVIDER.lower()
+
+    if provider == "google":
+        try:
+            from src.integrations.google_auth import get_google_auth_url
+            auth_url, flow = get_google_auth_url()
+            context.user_data["setup_oauth_flow"] = flow
+            await update.message.reply_text(
+                "Let's connect your Google Calendar!\n\n"
+                f"1. Open this link:\n{auth_url}\n\n"
+                "2. Sign in and authorize the app\n"
+                "3. Copy the authorization code and paste it here",
+            )
+            return SETUP_WAITING_AUTH_CODE
+        except Exception as exc:
+            logger.error("Setup error (Google auth URL): %s", exc)
+            await update.message.reply_text(
+                "Sorry, couldn't generate the authorization URL. "
+                "Please check the server configuration."
+            )
+            return ConversationHandler.END
+
+    if provider == "caldav":
+        context.user_data["setup_provider"] = "caldav"
+        await update.message.reply_text(
+            "Let's connect your CalDAV calendar!\n\n"
+            "Please paste your CalDAV credentials as JSON:\n"
+            '`{"url": "...", "username": "...", "password": "...", "calendar_name": "..."}`\n\n'
+            "The `calendar_name` field is optional.",
+            parse_mode="Markdown",
+        )
+        return SETUP_WAITING_AUTH_CODE
+
+    if provider == "outlook":
+        await update.message.reply_text(
+            "Outlook setup is managed at the server level. "
+            "Please contact an admin to configure your account."
+        )
+        return ConversationHandler.END
+
+    await update.message.reply_text(f"Unknown calendar provider: {provider}")
+    return ConversationHandler.END
+
+
+async def setup_receive_code(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Receive the auth code or credentials during /setup."""
+    user_db = _get_user_db(context)
+    if user_db is None:
+        await update.message.reply_text("User management is not enabled.")
+        return ConversationHandler.END
+
+    user_id = update.effective_user.id
+    text = update.message.text.strip()
+    provider = settings.CALENDAR_PROVIDER.lower()
+
+    if provider == "google":
+        flow = context.user_data.pop("setup_oauth_flow", None)
+        if flow is None:
+            await update.message.reply_text(
+                "Session expired. Please run /setup again."
+            )
+            return ConversationHandler.END
+
+        try:
+            from src.integrations.google_auth import exchange_google_auth_code
+            token_json = exchange_google_auth_code(flow, text)
+            user_db.set_calendar_token(user_id, token_json)
+            user_db.mark_onboarded(user_id)
+            # Clear cached service so it's recreated with new credentials
+            context.user_data.pop("action_service", None)
+            await update.message.reply_text(
+                "Google Calendar connected successfully!\n"
+                "You're all set. Try sending me a message to create an event."
+            )
+        except Exception as exc:
+            logger.error("Setup error (Google token exchange): %s", exc)
+            await update.message.reply_text(
+                "Invalid authorization code. Please run /setup to try again."
+            )
+        return ConversationHandler.END
+
+    if provider == "caldav":
+        import json
+        try:
+            creds = json.loads(text)
+            if "url" not in creds or "username" not in creds or "password" not in creds:
+                await update.message.reply_text(
+                    "Missing required fields. Please include: url, username, password."
+                )
+                return SETUP_WAITING_AUTH_CODE
+            token_json = json.dumps(creds)
+            user_db.set_calendar_token(user_id, token_json)
+            user_db.mark_onboarded(user_id)
+            context.user_data.pop("action_service", None)
+            await update.message.reply_text(
+                "CalDAV calendar connected successfully!\n"
+                "You're all set. Try sending me a message to create an event."
+            )
+        except json.JSONDecodeError:
+            await update.message.reply_text(
+                "Invalid JSON. Please paste valid JSON credentials."
+            )
+            return SETUP_WAITING_AUTH_CODE
+        return ConversationHandler.END
+
+    await update.message.reply_text("Unexpected state. Please run /setup again.")
+    return ConversationHandler.END
+
+
+async def setup_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Cancel /setup conversation."""
+    context.user_data.pop("setup_oauth_flow", None)
+    context.user_data.pop("setup_provider", None)
+    await update.message.reply_text("Setup cancelled.")
+    return ConversationHandler.END
+
+
+# ---------------------------------------------------------------------------
+# Bootstrap — auto-create admin users from ALLOWED_USER_IDS
+# ---------------------------------------------------------------------------
+
+
+def _bootstrap_admins() -> None:
+    """Auto-create admin users from ALLOWED_USER_IDS and migrate existing tokens.
+
+    Called once during build_app(). Ensures backward compatibility:
+    existing single-user setups get their admin auto-registered and
+    any existing token.json is migrated to the UserDB.
+    """
+    from src.data.db import ChoreDB, ContactDB, UserDB
+
+    # Ensure chores/contacts tables have the user_id column before backfill
+    ChoreDB()
+    ContactDB()
+    user_db = UserDB()
+
+    for uid in settings.ALLOWED_USER_IDS:
+        if not user_db.is_registered(uid):
+            user_db.add_user(
+                telegram_user_id=uid,
+                display_name=f"Admin {uid}",
+                invited_by=None,
+                is_admin=True,
+            )
+        db_user = user_db.get_user(uid)
+        if db_user and not db_user.calendar_token_json:
+            # Migrate existing Google token.json if present
+            if settings.CALENDAR_PROVIDER.lower() == "google":
+                token_path = Path(settings.GOOGLE_TOKEN_PATH)
+                if token_path.exists():
+                    user_db.set_calendar_token(uid, token_path.read_text())
+                    user_db.mark_onboarded(uid)
+            else:
+                # For non-Google providers, mark as onboarded (server-level config)
+                user_db.mark_onboarded(uid)
+
+    # Backfill orphan chores/contacts to first admin
+    if settings.ALLOWED_USER_IDS:
+        first_admin = settings.ALLOWED_USER_IDS[0]
+        user_db.backfill_user_id(first_admin)
+
+    return user_db
+
+
+# ---------------------------------------------------------------------------
 # App builder
 # ---------------------------------------------------------------------------
 
@@ -955,7 +1331,11 @@ def build_app(
     """
     app = ApplicationBuilder().token(settings.TELEGRAM_BOT_TOKEN).build()
 
-    # Wire default adapters if not provided
+    # Bootstrap multi-user support — auto-creates admins from ALLOWED_USER_IDS
+    user_db = _bootstrap_admins()
+    app.bot_data["user_db"] = user_db
+
+    # Wire default adapters if not provided (legacy shared instances for notifier)
     if calendar is None:
         from src.adapters.calendar_factory import create_calendar_adapter
         calendar = create_calendar_adapter()
@@ -964,15 +1344,9 @@ def build_app(
         from src.adapters.telegram_notifier import TelegramNotifier
         notifier = TelegramNotifier(app.bot)
 
-    # Create the service layer with contact DB
-    from src.data.db import ContactDB
-    contact_db = ContactDB()
-    service = ActionService(calendar, contact_db=contact_db)
-
-    # Store ports and service in bot_data for handler access
+    # Store ports in bot_data (no shared action_service — per-user via _get_service)
     app.bot_data["calendar"] = calendar
     app.bot_data["notifier"] = notifier
-    app.bot_data["action_service"] = service
 
     # Commands
     app.add_handler(CommandHandler("start", cmd_start))
@@ -981,13 +1355,29 @@ def build_app(
     app.add_handler(CommandHandler("chores", cmd_chores))
     app.add_handler(CommandHandler("done", cmd_done))
     app.add_handler(CommandHandler("deletechore", cmd_deletechore))
+
+    # Admin commands
+    app.add_handler(CommandHandler("invite", cmd_invite))
+    app.add_handler(CommandHandler("users", cmd_users))
+
+    # Callback query handlers
     app.add_handler(CallbackQueryHandler(_handle_deletechore_callback, pattern=r"^delchore:\d+$"))
     app.add_handler(CallbackQueryHandler(_handle_conflict_callback, pattern=r"^conflict:"))
     app.add_handler(CallbackQueryHandler(_handle_batch_cancel_callback, pattern=r"^batchcancel:"))
     app.add_handler(CallbackQueryHandler(_handle_slot_callback, pattern=r"^slot:"))
 
-    # /addchore conversation handler
+    # /setup conversation handler — calendar onboarding
     _text = filters.TEXT & ~filters.COMMAND
+    setup_conv = ConversationHandler(
+        entry_points=[CommandHandler("setup", cmd_setup)],
+        states={
+            SETUP_WAITING_AUTH_CODE: [MessageHandler(_text, setup_receive_code)],
+        },
+        fallbacks=[CommandHandler("cancel", setup_cancel)],
+    )
+    app.add_handler(setup_conv)
+
+    # /addchore conversation handler
     addchore_conv = ConversationHandler(
         entry_points=[CommandHandler("addchore", cmd_addchore)],
         states={
@@ -1009,7 +1399,7 @@ def build_app(
     app.add_handler(MessageHandler(filters.VOICE, handle_voice))
 
     # Morning Briefing scheduler — Telegram-specific scheduling logic
-    _setup_morning_briefing(app, calendar, notifier)
+    _setup_morning_briefing(app, notifier)
 
     logger.info("Telegram bot application built with %d handlers", len(app.handlers[0]))
     return app
@@ -1017,7 +1407,6 @@ def build_app(
 
 def _setup_morning_briefing(
     app: Application,
-    calendar: CalendarPort,
     notifier: NotificationPort,
 ) -> None:
     """Register the daily morning briefing job at 08:00 Asia/Jerusalem."""
@@ -1027,7 +1416,8 @@ def _setup_morning_briefing(
     briefing_time = dt_time(hour=settings.MORNING_BRIEFING_HOUR, minute=0, tzinfo=tz)
 
     async def _morning_job_callback(context: ContextTypes.DEFAULT_TYPE) -> None:
-        await send_morning_summary(calendar, notifier)
+        user_db = context.bot_data.get("user_db")
+        await send_morning_summary(notifier, user_db=user_db)
 
     app.job_queue.run_daily(
         _morning_job_callback,

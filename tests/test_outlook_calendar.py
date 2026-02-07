@@ -41,7 +41,7 @@ def _mock_graph_event(
     return event
 
 
-_PATCH_CLIENT = "src.adapters.outlook_calendar.get_graph_client"
+_PATCH_CLIENT = "src.integrations.ms_auth.get_graph_client"
 _PATCH_SETTINGS = "src.adapters.outlook_calendar.settings"
 
 

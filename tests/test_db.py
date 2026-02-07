@@ -127,6 +127,64 @@ class TestChoreDBDelete:
         assert chore_db.delete_chore(chore.id) is False
 
 
+class TestChoreDBUserScoping:
+    def test_add_chore_with_user_id(self, chore_db):
+        chore = chore_db.add_chore(
+            name="Trash", frequency_days=7, assigned_to="Amit", user_id=12345,
+        )
+        assert chore.user_id == 12345
+
+    def test_list_all_filters_by_user_id(self, chore_db):
+        chore_db.add_chore(name="A", frequency_days=1, assigned_to="X", user_id=111)
+        chore_db.add_chore(name="B", frequency_days=2, assigned_to="Y", user_id=222)
+        chore_db.add_chore(name="C", frequency_days=3, assigned_to="Z", user_id=111)
+        chores = chore_db.list_all(user_id=111)
+        assert len(chores) == 2
+        assert {c.name for c in chores} == {"A", "C"}
+
+    def test_list_all_no_user_id_returns_all(self, chore_db):
+        chore_db.add_chore(name="A", frequency_days=1, assigned_to="X", user_id=111)
+        chore_db.add_chore(name="B", frequency_days=2, assigned_to="Y", user_id=222)
+        chores = chore_db.list_all()
+        assert len(chores) == 2
+
+    def test_get_due_chores_filters_by_user_id(self, chore_db):
+        from datetime import date
+        today = date.today().isoformat()
+        chore_db.add_chore(name="Mine", frequency_days=1, assigned_to="X",
+                           user_id=111, start_date=today)
+        chore_db.add_chore(name="Theirs", frequency_days=1, assigned_to="Y",
+                           user_id=222, start_date=today)
+        due = chore_db.get_due_chores(target_date=today, user_id=111)
+        assert len(due) == 1
+        assert due[0].name == "Mine"
+
+
+class TestContactDBUserScoping:
+    def test_add_contact_with_user_id(self, contact_db):
+        contact = contact_db.add_contact("Yahav", "yahav@gmail.com", user_id=111)
+        assert contact.user_id == 111
+
+    def test_find_by_name_filters_by_user_id(self, contact_db):
+        contact_db.add_contact("Yahav", "yahav@gmail.com", user_id=111)
+        contact_db.add_contact("Yahav", "yahav2@gmail.com", user_id=222)
+        found = contact_db.find_by_name("Yahav", user_id=111)
+        assert found is not None
+        assert found.email == "yahav@gmail.com"
+
+    def test_find_by_name_no_user_id(self, contact_db):
+        contact_db.add_contact("Yahav", "yahav@gmail.com", user_id=111)
+        found = contact_db.find_by_name("Yahav")
+        assert found is not None
+
+    def test_list_all_filters_by_user_id(self, contact_db):
+        contact_db.add_contact("A", "a@x.com", user_id=111)
+        contact_db.add_contact("B", "b@x.com", user_id=222)
+        contacts = contact_db.list_all(user_id=111)
+        assert len(contacts) == 1
+        assert contacts[0].name == "A"
+
+
 class TestChoreDBMigration:
     def test_migration_adds_columns_to_old_schema(self, tmp_db_path):
         """Simulate an old DB without the new columns, verify migration works."""

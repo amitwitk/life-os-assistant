@@ -20,8 +20,8 @@ from src.integrations.gcal_service import (
 )
 from src.core.parser import ParsedEvent
 
-# Patch path: the adapter is where get_calendar_service is actually called
-_PATCH_GCS = "src.adapters.google_calendar.get_calendar_service"
+# Patch path: get_calendar_service is imported inside _get_service()
+_PATCH_GCS = "src.integrations.google_auth.get_calendar_service"
 
 
 # ---------------------------------------------------------------------------

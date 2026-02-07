@@ -31,10 +31,10 @@ from src.core.action_service import (
 # ---------------------------------------------------------------------------
 
 
-def _make_service(calendar=None):
+def _make_service(calendar=None, user_id=None):
     """Create an ActionService with a mock calendar."""
     cal = calendar or MagicMock()
-    return ActionService(cal), cal
+    return ActionService(cal, user_id=user_id), cal
 
 
 # ---------------------------------------------------------------------------
@@ -2038,3 +2038,46 @@ class TestEventIdTracking:
 
         assert isinstance(response, SuccessResponse)
         assert response.event.event_id == "ev99"
+
+
+# ---------------------------------------------------------------------------
+# user_id propagation
+# ---------------------------------------------------------------------------
+
+
+class TestUserIdPropagation:
+    def test_create_chore_passes_user_id(self):
+        from src.data.models import Chore
+
+        service, _ = _make_service(user_id=12345)
+
+        chore = Chore(
+            id=1, name="Trash", frequency_days=7, duration_minutes=15,
+            preferred_time_start="17:00", preferred_time_end="21:00",
+            next_due="2026-02-07", assigned_to="Amit",
+        )
+        mock_db = MagicMock()
+        mock_db.add_chore.return_value = chore
+
+        with patch("src.data.db.ChoreDB", return_value=mock_db):
+            service.create_chore(
+                name="Trash", frequency_days=7, assigned_to="Amit",
+                duration_minutes=15, preferred_time_start="17:00",
+                preferred_time_end="21:00",
+            )
+
+        call_kwargs = mock_db.add_chore.call_args
+        assert call_kwargs[1].get("user_id") == 12345 or call_kwargs[0][-1] == 12345
+
+    def test_list_chores_passes_user_id(self):
+        from src.data.models import Chore
+
+        service, _ = _make_service(user_id=12345)
+
+        mock_db = MagicMock()
+        mock_db.list_all.return_value = []
+
+        with patch("src.data.db.ChoreDB", return_value=mock_db):
+            service.list_chores(active_only=True)
+
+        mock_db.list_all.assert_called_once_with(active_only=True, user_id=12345)
