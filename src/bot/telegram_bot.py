@@ -37,6 +37,7 @@ from src.core.action_service import (
     BatchCancelPromptResponse,
     BatchSummaryResponse,
     ConflictPromptResponse,
+    ContactPromptResponse,
     ErrorResponse,
     NoActionResponse,
     PendingBatchCancel,
@@ -126,6 +127,11 @@ async def _render_response(
             reply_markup=InlineKeyboardMarkup(buttons),
         )
 
+    elif isinstance(response, ContactPromptResponse):
+        context.user_data["pending_contact"] = response.pending
+        context.user_data["awaiting_contact_email"] = True
+        await update.message.reply_text(response.message, parse_mode="Markdown")
+
     elif isinstance(response, SuccessResponse):
         msg = response.message
         if response.event and response.event.link:
@@ -148,6 +154,10 @@ async def _process_text(
     text: str, update: Update, context: ContextTypes.DEFAULT_TYPE,
 ) -> None:
     """Parse text via ActionService, render the result."""
+    if context.user_data.get("awaiting_contact_email"):
+        await _handle_contact_email(text, update, context)
+        return
+
     if context.user_data.get("awaiting_custom_time"):
         await _handle_custom_time(text, update, context)
         return
@@ -230,6 +240,36 @@ async def _handle_custom_time(
         await update.message.reply_text(response.message)
 
     context.user_data.pop("pending_event", None)
+
+
+# ---------------------------------------------------------------------------
+# Contact email resolution
+# ---------------------------------------------------------------------------
+
+
+async def _handle_contact_email(
+    text: str, update: Update, context: ContextTypes.DEFAULT_TYPE,
+) -> None:
+    """Handle user-typed email for contact resolution."""
+    context.user_data.pop("awaiting_contact_email", None)
+
+    pending = context.user_data.get("pending_contact")
+    if not pending:
+        await update.message.reply_text("No pending contact resolution. Please start over.")
+        return
+
+    service: ActionService = context.bot_data["action_service"]
+    response = await service.resolve_contact(pending, text.strip())
+
+    if isinstance(response, ContactPromptResponse):
+        # More contacts to resolve — stay in the flow
+        context.user_data["pending_contact"] = response.pending
+        context.user_data["awaiting_contact_email"] = True
+        await update.message.reply_text(response.message, parse_mode="Markdown")
+    else:
+        # Done resolving — render the final result
+        context.user_data.pop("pending_contact", None)
+        await _render_response(response, update, context)
 
 
 # ---------------------------------------------------------------------------
@@ -873,8 +913,10 @@ def build_app(
         from src.adapters.telegram_notifier import TelegramNotifier
         notifier = TelegramNotifier(app.bot)
 
-    # Create the service layer
-    service = ActionService(calendar)
+    # Create the service layer with contact DB
+    from src.data.db import ContactDB
+    contact_db = ContactDB()
+    service = ActionService(calendar, contact_db=contact_db)
 
     # Store ports and service in bot_data for handler access
     app.bot_data["calendar"] = calendar

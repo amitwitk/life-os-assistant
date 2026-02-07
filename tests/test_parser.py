@@ -365,3 +365,50 @@ class TestEmptyTimeParsing:
         """ParsedEvent can be created without time — defaults to empty string."""
         event = ParsedEvent(event="Test", date="2026-02-14")
         assert event.time == ""
+
+
+# ---------------------------------------------------------------------------
+# Tests for mentioned_contacts field
+# ---------------------------------------------------------------------------
+
+
+class TestMentionedContacts:
+    def test_parsed_event_defaults_to_empty(self):
+        p = ParsedEvent(event="Lunch", date="2026-02-14", time="12:00")
+        assert p.mentioned_contacts == []
+        assert p.guests == []
+
+    @pytest.mark.asyncio
+    async def test_parse_event_with_mentioned_contacts(self):
+        llm_response = '[{"intent": "create", "event": "Meeting with Yahav", "date": "2026-02-14", "time": "16:00", "duration_minutes": 60, "description": "", "guests": [], "mentioned_contacts": ["Yahav"]}]'
+        with patch("src.core.parser.complete", AsyncMock(return_value=llm_response)):
+            result = await parse_message("Meeting with Yahav tomorrow at 4pm")
+        assert len(result) == 1
+        assert isinstance(result[0], ParsedEvent)
+        assert result[0].mentioned_contacts == ["Yahav"]
+
+    @pytest.mark.asyncio
+    async def test_parse_event_with_guests(self):
+        llm_response = '[{"intent": "create", "event": "Meeting", "date": "2026-02-14", "time": "16:00", "duration_minutes": 60, "description": "", "guests": ["dan@example.com"], "mentioned_contacts": []}]'
+        with patch("src.core.parser.complete", AsyncMock(return_value=llm_response)):
+            result = await parse_message("Meeting tomorrow with dan@example.com")
+        assert len(result) == 1
+        assert result[0].guests == ["dan@example.com"]
+
+    @pytest.mark.asyncio
+    async def test_parse_event_with_both(self):
+        llm_response = '[{"intent": "create", "event": "Meeting", "date": "2026-02-14", "time": "16:00", "duration_minutes": 60, "description": "", "guests": ["dan@example.com"], "mentioned_contacts": ["Yahav"]}]'
+        with patch("src.core.parser.complete", AsyncMock(return_value=llm_response)):
+            result = await parse_message("Meeting with Yahav and dan@example.com")
+        assert len(result) == 1
+        assert result[0].guests == ["dan@example.com"]
+        assert result[0].mentioned_contacts == ["Yahav"]
+
+    def test_backward_compat_no_contacts_field(self):
+        """Old LLM responses without guests/mentioned_contacts still work."""
+        p = ParsedEvent(
+            intent="create", event="Dentist", date="2026-02-14",
+            time="16:00", duration_minutes=60, description="",
+        )
+        assert p.mentioned_contacts == []
+        assert p.guests == []

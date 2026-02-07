@@ -29,3 +29,10 @@ def chore_db(tmp_db_path):
     """Return a ChoreDB instance backed by a temp file."""
     from src.data.db import ChoreDB
     return ChoreDB(db_path=tmp_db_path)
+
+
+@pytest.fixture
+def contact_db(tmp_path):
+    """Return a ContactDB instance backed by a temp file."""
+    from src.data.db import ContactDB
+    return ContactDB(db_path=str(tmp_path / "test_contacts.db"))

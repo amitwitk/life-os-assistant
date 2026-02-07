@@ -12,7 +12,7 @@ import sqlite3
 from datetime import date, timedelta
 from pathlib import Path
 
-from src.data.models import Chore
+from src.data.models import Chore, Contact
 
 logger = logging.getLogger(__name__)
 
@@ -213,6 +213,92 @@ class ChoreDB:
         deleted = cursor.rowcount > 0
         if deleted:
             logger.info("Chore #%d soft-deleted", chore_id)
+        return deleted
+
+
+class ContactDB:
+    """SQLite-backed storage for named contacts (name → email mapping)."""
+
+    def __init__(self, db_path: str | None = None) -> None:
+        if db_path is None:
+            from src.config import settings
+            db_path = settings.DATABASE_PATH
+
+        self._db_path = db_path
+        Path(db_path).parent.mkdir(parents=True, exist_ok=True)
+        self._init_db()
+
+    def _connect(self) -> sqlite3.Connection:
+        conn = sqlite3.connect(self._db_path)
+        conn.row_factory = sqlite3.Row
+        return conn
+
+    def _init_db(self) -> None:
+        with self._connect() as conn:
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS contacts (
+                    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+                    name            TEXT NOT NULL,
+                    email           TEXT NOT NULL,
+                    name_normalized TEXT NOT NULL
+                )
+            """)
+        logger.debug("Contacts table initialized at %s", self._db_path)
+
+    @staticmethod
+    def _row_to_contact(row: sqlite3.Row) -> Contact:
+        return Contact(
+            id=row["id"],
+            name=row["name"],
+            email=row["email"],
+            name_normalized=row["name_normalized"],
+        )
+
+    def add_contact(self, name: str, email: str) -> Contact:
+        """Insert a new contact. Normalizes the name for case-insensitive lookup."""
+        name_normalized = name.strip().lower()
+        with self._connect() as conn:
+            cursor = conn.execute(
+                "INSERT INTO contacts (name, email, name_normalized) VALUES (?, ?, ?)",
+                (name.strip(), email.strip(), name_normalized),
+            )
+            contact_id = cursor.lastrowid
+
+        contact = Contact(
+            id=contact_id,
+            name=name.strip(),
+            email=email.strip(),
+            name_normalized=name_normalized,
+        )
+        logger.info("Contact added: #%d '%s' <%s>", contact_id, name, email)
+        return contact
+
+    def find_by_name(self, name: str) -> Contact | None:
+        """Case-insensitive exact match on name."""
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM contacts WHERE name_normalized = ?",
+                (name.strip().lower(),),
+            ).fetchone()
+        if row is None:
+            return None
+        return self._row_to_contact(row)
+
+    def list_all(self) -> list[Contact]:
+        """Return all contacts."""
+        with self._connect() as conn:
+            rows = conn.execute("SELECT * FROM contacts ORDER BY name").fetchall()
+        return [self._row_to_contact(r) for r in rows]
+
+    def delete_contact(self, contact_id: int) -> bool:
+        """Permanently delete a contact by ID."""
+        with self._connect() as conn:
+            cursor = conn.execute(
+                "DELETE FROM contacts WHERE id = ?", (contact_id,),
+            )
+        deleted = cursor.rowcount > 0
+        if deleted:
+            logger.info("Contact #%d deleted", contact_id)
         return deleted
 
 

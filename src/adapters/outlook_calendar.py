@@ -17,11 +17,11 @@ from msgraph.generated.models.recurrence_pattern import RecurrencePattern
 from msgraph.generated.models.recurrence_pattern_type import RecurrencePatternType
 from msgraph.generated.models.recurrence_range import RecurrenceRange
 from msgraph.generated.models.recurrence_range_type import RecurrenceRangeType
-from msgraph.generated.models.item_body import ItemBody
-from msgraph.generated.models.body_type import BodyType
 from msgraph.generated.models.attendee import Attendee
 from msgraph.generated.models.attendee_type import AttendeeType
+from msgraph.generated.models.body_type import BodyType
 from msgraph.generated.models.email_address import EmailAddress
+from msgraph.generated.models.item_body import ItemBody
 from msgraph.generated.users.item.calendar_view.calendar_view_request_builder import (
     CalendarViewRequestBuilder,
 )

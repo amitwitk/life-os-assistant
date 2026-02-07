@@ -35,7 +35,9 @@ class ParsedEvent(BaseModel):
         "date": "2025-02-14",
         "time": "16:00",
         "duration_minutes": 60,
-        "description": ""
+        "description": "",
+        "guests": [],
+        "mentioned_contacts": []
     }
     """
     intent: str = "create"
@@ -44,7 +46,8 @@ class ParsedEvent(BaseModel):
     time: str = ""     # HH:MM in 24h format, empty if not specified
     duration_minutes: int = 60
     description: str = ""
-    guests: list[str] = []
+    guests: list[str] = []                # explicit email addresses
+    mentioned_contacts: list[str] = []    # person names to resolve via contacts DB
 
 
 class CancelEvent(BaseModel):
@@ -142,7 +145,7 @@ Today's date is {today}.
 
 **Function 1: Create Event**
 If the user wants to schedule something, use this JSON schema:
-{{"intent": "create", "event": "string", "date": "YYYY-MM-DD", "time": "HH:MM", "duration_minutes": integer, "description": "string", "guests": ["email@example.com"]}}
+{{"intent": "create", "event": "string", "date": "YYYY-MM-DD", "time": "HH:MM", "duration_minutes": integer, "description": "string", "guests": ["email@example.com"], "mentioned_contacts": ["PersonName"]}}
 
 - "event" = short title for the calendar event.
 - "time" must be in 24-hour format. If the user does NOT specify a time, return "time": "".
@@ -150,6 +153,10 @@ If the user wants to schedule something, use this JSON schema:
 - "duration_minutes" defaults to 60 if not mentioned.
 - "guests" = optional list of email addresses to invite. Default to [] if no guests are mentioned.
 - Interpret relative dates ("tomorrow", "next Monday") relative to today.
+- "guests" = list of explicit email addresses mentioned. Default to [].
+- "mentioned_contacts" = list of people's NAMES mentioned as participants.
+  e.g., "meeting with Yahav and Dan" → ["Yahav", "Dan"]. Default to [].
+  Only include actual person names, not generic descriptions like "the team".
 
 **Function 2: Cancel Event**
 If the user's message contains keywords like "cancel", "delete", "remove", "ביטול", "בטל", "למחיקה", use this JSON schema:
