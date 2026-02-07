@@ -50,6 +50,8 @@ class EventInfo:
     date: str
     time: str
     link: str = ""
+    location: str = ""
+    maps_url: str = ""
 
 
 @dataclass
@@ -312,14 +314,24 @@ class ActionService:
                 from src.core.parser import ParsedEvent
                 pending.parsed_event_json["time"] = time_to_use
                 parsed = ParsedEvent(**pending.parsed_event_json)
+
+                # Enrich location (pipeline was bypassed for pending events)
+                enriched = await self._enrich_location(parsed)
+                if isinstance(enriched, ParsedEvent):
+                    parsed = enriched
+
                 created = await self._calendar.add_event(parsed)
                 link = created.get("htmlLink", "")
+                msg = f"\u2705 Event created: *{parsed.event}* on {parsed.date} at {time_to_use}"
+                if parsed.location:
+                    msg += f"\n\U0001f4cd {parsed.location}"
                 return SuccessResponse(
                     kind=ResponseKind.SUCCESS,
-                    message=f"\u2705 Event created: *{parsed.event}* on {parsed.date} at {time_to_use}",
+                    message=msg,
                     event=EventInfo(
                         summary=parsed.event, date=parsed.date,
                         time=time_to_use, link=link,
+                        location=parsed.location, maps_url=parsed.maps_url,
                     ),
                 )
             elif pending.pending_type == "reschedule":
@@ -640,7 +652,7 @@ class ActionService:
     # Enricher pipeline for create events
     # ------------------------------------------------------------------
 
-    _CREATE_PIPELINE = ["_enrich_contacts", "_enrich_time", "_enrich_conflicts"]
+    _CREATE_PIPELINE = ["_enrich_contacts", "_enrich_time", "_enrich_location", "_enrich_conflicts"]
 
     async def _enrich_contacts(self, parsed: object) -> object | ServiceResponse:
         """Resolve mentioned contacts into guest emails.
@@ -690,6 +702,34 @@ class ActionService:
 
         return await self._suggest_slots(parsed)
 
+    async def _enrich_location(self, parsed: object) -> object | ServiceResponse:
+        """Enrich raw location text via Google Maps Places API.
+
+        Returns:
+            ParsedEvent with enriched location + maps_url, or unchanged if no location.
+        """
+        from src.core.parser import ParsedEvent
+
+        if not isinstance(parsed, ParsedEvent) or not parsed.location:
+            return parsed
+
+        from src.config import settings
+
+        if not settings.GOOGLE_MAPS_API_KEY:
+            return parsed
+
+        from src.integrations.google_maps import enrich_location
+
+        result = await enrich_location(parsed.location, settings.GOOGLE_MAPS_API_KEY)
+        if result is None:
+            return parsed
+
+        if result.formatted_address:
+            display = f"{result.display_name}, {result.formatted_address}"
+        else:
+            display = result.display_name
+        return parsed.model_copy(update={"location": display, "maps_url": result.maps_url})
+
     async def _enrich_conflicts(self, parsed: object) -> object | ServiceResponse:
         """Check for time conflicts before creating.
 
@@ -728,12 +768,16 @@ class ActionService:
         try:
             created = await self._calendar.add_event(parsed)
             link = created.get("htmlLink", "")
+            msg = f"\u2705 Event created: *{parsed.event}* on {parsed.date} at {parsed.time}"
+            if parsed.location:
+                msg += f"\n\U0001f4cd {parsed.location}"
             return SuccessResponse(
                 kind=ResponseKind.SUCCESS,
-                message=f"\u2705 Event created: *{parsed.event}* on {parsed.date} at {parsed.time}",
+                message=msg,
                 event=EventInfo(
                     summary=parsed.event, date=parsed.date,
                     time=parsed.time, link=link,
+                    location=parsed.location, maps_url=parsed.maps_url,
                 ),
             )
         except CalendarError as exc:

@@ -22,6 +22,7 @@ from msgraph.generated.models.attendee_type import AttendeeType
 from msgraph.generated.models.body_type import BodyType
 from msgraph.generated.models.email_address import EmailAddress
 from msgraph.generated.models.item_body import ItemBody
+from msgraph.generated.models.location import Location
 from msgraph.generated.users.item.calendar_view.calendar_view_request_builder import (
     CalendarViewRequestBuilder,
 )
@@ -96,6 +97,10 @@ class OutlookCalendarAdapter:
                 for g in parsed_event.guests
             ]
 
+        location_obj = None
+        if parsed_event.location:
+            location_obj = Location(display_name=parsed_event.location)
+
         event = Event(
             subject=parsed_event.event,
             body=ItemBody(content=parsed_event.description, content_type=BodyType.Text),
@@ -108,6 +113,7 @@ class OutlookCalendarAdapter:
                 time_zone=settings.TIMEZONE,
             ),
             attendees=attendees,
+            location=location_obj,
         )
 
         try:

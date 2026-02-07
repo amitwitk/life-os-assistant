@@ -58,6 +58,9 @@ class Settings(BaseModel):
     # Security
     ALLOWED_USER_IDS: list[int] = []
 
+    # Google Maps Places API (optional — location enrichment)
+    GOOGLE_MAPS_API_KEY: str = ""
+
     # Morning Briefing
     MORNING_BRIEFING_HOUR: int = 8
     TIMEZONE: str = "Asia/Jerusalem"
@@ -109,6 +112,7 @@ def _load_settings() -> Settings:
         CALDAV_CALENDAR_NAME=os.getenv("CALDAV_CALENDAR_NAME", ""),
         DATABASE_PATH=os.getenv("DATABASE_PATH", "data/chores.db"),
         ALLOWED_USER_IDS=os.getenv("ALLOWED_USER_IDS", ""),
+        GOOGLE_MAPS_API_KEY=os.getenv("GOOGLE_MAPS_API_KEY", ""),
         MORNING_BRIEFING_HOUR=os.getenv("MORNING_BRIEFING_HOUR", "8"),
         TIMEZONE=os.getenv("TIMEZONE", "Asia/Jerusalem"),
     )

@@ -134,6 +134,8 @@ async def _render_response(
 
     elif isinstance(response, SuccessResponse):
         msg = response.message
+        if response.event and response.event.maps_url:
+            msg += f"\n[Open in Google Maps]({response.event.maps_url})"
         if response.event and response.event.link:
             msg += f"\n[Open in Google Calendar]({response.event.link})"
         await update.message.reply_text(msg, parse_mode="Markdown")
@@ -210,8 +212,11 @@ async def _handle_conflict_callback(
     response = await service.resolve_conflict(pending, action)
 
     msg = response.message
-    if isinstance(response, SuccessResponse) and response.event and response.event.link:
-        msg += f"\n[Open in Google Calendar]({response.event.link})"
+    if isinstance(response, SuccessResponse) and response.event:
+        if response.event.maps_url:
+            msg += f"\n[Open in Google Maps]({response.event.maps_url})"
+        if response.event.link:
+            msg += f"\n[Open in Google Calendar]({response.event.link})"
     await query.edit_message_text(msg, parse_mode="Markdown")
 
     context.user_data.pop("pending_event", None)
@@ -233,6 +238,8 @@ async def _handle_custom_time(
 
     if isinstance(response, SuccessResponse):
         msg = response.message
+        if response.event and response.event.maps_url:
+            msg += f"\n[Open in Google Maps]({response.event.maps_url})"
         if response.event and response.event.link:
             msg += f"\n[Open in Google Calendar]({response.event.link})"
         await update.message.reply_text(msg, parse_mode="Markdown")
@@ -340,8 +347,11 @@ async def _handle_slot_callback(
     response = await service.select_slot(pending, selected_time)
 
     msg = response.message
-    if isinstance(response, SuccessResponse) and response.event and response.event.link:
-        msg += f"\n[Open in Google Calendar]({response.event.link})"
+    if isinstance(response, SuccessResponse) and response.event:
+        if response.event.maps_url:
+            msg += f"\n[Open in Google Maps]({response.event.maps_url})"
+        if response.event.link:
+            msg += f"\n[Open in Google Calendar]({response.event.link})"
     await query.edit_message_text(msg, parse_mode="Markdown")
 
     context.user_data.pop("pending_slot", None)
@@ -392,8 +402,11 @@ async def _handle_slot_text_input(
     response = await service.select_slot(pending, selected_time)
 
     msg = response.message
-    if isinstance(response, SuccessResponse) and response.event and response.event.link:
-        msg += f"\n[Open in Google Calendar]({response.event.link})"
+    if isinstance(response, SuccessResponse) and response.event:
+        if response.event.maps_url:
+            msg += f"\n[Open in Google Maps]({response.event.maps_url})"
+        if response.event.link:
+            msg += f"\n[Open in Google Calendar]({response.event.link})"
         await update.message.reply_text(msg, parse_mode="Markdown")
     elif isinstance(response, ErrorResponse):
         await update.message.reply_text(response.message)
