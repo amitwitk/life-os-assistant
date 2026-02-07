@@ -13,9 +13,11 @@ from src.core.action_service import (
     BatchCancelPromptResponse,
     BatchSummaryResponse,
     ConflictPromptResponse,
+    ContactPromptResponse,
     ErrorResponse,
     NoActionResponse,
     PendingBatchCancel,
+    PendingContactResolution,
     PendingEvent,
     QueryResultResponse,
     ResponseKind,
@@ -757,3 +759,232 @@ class TestChoreOperations:
             )
 
         assert result == mock_slot
+
+
+# ---------------------------------------------------------------------------
+# Contact resolution
+# ---------------------------------------------------------------------------
+
+
+def _make_service_with_contacts(calendar=None, contact_db=None):
+    """Create an ActionService with a mock calendar and optional contact DB."""
+    cal = calendar or MagicMock()
+    return ActionService(cal, contact_db=contact_db), cal
+
+
+class TestContactResolution:
+    @pytest.mark.asyncio
+    async def test_known_contact_auto_resolves(self, contact_db):
+        """Event with a known contact should auto-resolve to guest email."""
+        from src.core.parser import ParsedEvent
+        from src.core.conflict_checker import ConflictResult
+
+        contact_db.add_contact("Yahav", "yahav@gmail.com")
+
+        service, cal = _make_service_with_contacts(contact_db=contact_db)
+        cal.add_event = AsyncMock(return_value={"htmlLink": "https://cal/1"})
+
+        parsed = ParsedEvent(
+            event="Meeting with Yahav", date="2026-02-08", time="14:00",
+            mentioned_contacts=["Yahav"],
+        )
+        no_conflict = ConflictResult(has_conflict=False)
+
+        with patch("src.core.parser.parse_message", AsyncMock(return_value=[parsed])), \
+             patch("src.core.conflict_checker.check_conflict", AsyncMock(return_value=no_conflict)):
+            response = await service.process_text("Meeting with Yahav at 14:00")
+
+        assert isinstance(response, SuccessResponse)
+        # Verify the calendar was called with guests
+        call_args = cal.add_event.call_args[0][0]
+        assert "yahav@gmail.com" in call_args.guests
+        assert call_args.mentioned_contacts == []
+
+    @pytest.mark.asyncio
+    async def test_unknown_contact_returns_prompt(self, contact_db):
+        """Event with unknown contact should return ContactPromptResponse."""
+        from src.core.parser import ParsedEvent
+
+        service, cal = _make_service_with_contacts(contact_db=contact_db)
+
+        parsed = ParsedEvent(
+            event="Meeting with Yahav", date="2026-02-08", time="14:00",
+            mentioned_contacts=["Yahav"],
+        )
+
+        with patch("src.core.parser.parse_message", AsyncMock(return_value=[parsed])):
+            response = await service.process_text("Meeting with Yahav at 14:00")
+
+        assert isinstance(response, ContactPromptResponse)
+        assert response.kind == ResponseKind.CONTACT_PROMPT
+        assert response.contact_name == "Yahav"
+        assert response.pending is not None
+        assert "Yahav" in response.pending.unresolved_contacts
+
+    @pytest.mark.asyncio
+    async def test_resolve_contact_saves_and_retries(self, contact_db):
+        """resolve_contact should save to DB and re-execute the action."""
+        from src.core.conflict_checker import ConflictResult
+
+        service, cal = _make_service_with_contacts(contact_db=contact_db)
+        cal.add_event = AsyncMock(return_value={"htmlLink": "https://cal/1"})
+
+        pending = PendingContactResolution(
+            action_type="create",
+            parsed_action_json={
+                "intent": "create", "event": "Meeting with Yahav",
+                "date": "2026-02-08", "time": "14:00",
+                "duration_minutes": 60, "description": "",
+                "guests": [], "mentioned_contacts": ["Yahav"],
+            },
+            resolved_contacts={},
+            unresolved_contacts=["Yahav"],
+            current_asking="Yahav",
+        )
+
+        no_conflict = ConflictResult(has_conflict=False)
+        with patch("src.core.conflict_checker.check_conflict", AsyncMock(return_value=no_conflict)):
+            response = await service.resolve_contact(pending, "yahav@gmail.com")
+
+        assert isinstance(response, SuccessResponse)
+        # Verify contact was saved to DB
+        found = contact_db.find_by_name("Yahav")
+        assert found is not None
+        assert found.email == "yahav@gmail.com"
+
+    @pytest.mark.asyncio
+    async def test_resolve_contact_invalid_email_reprompts(self, contact_db):
+        """Invalid email should re-prompt for the same contact."""
+        service, cal = _make_service_with_contacts(contact_db=contact_db)
+
+        pending = PendingContactResolution(
+            action_type="create",
+            parsed_action_json={
+                "intent": "create", "event": "Meeting",
+                "date": "2026-02-08", "time": "14:00",
+                "duration_minutes": 60, "description": "",
+                "guests": [], "mentioned_contacts": ["Yahav"],
+            },
+            resolved_contacts={},
+            unresolved_contacts=["Yahav"],
+            current_asking="Yahav",
+        )
+
+        response = await service.resolve_contact(pending, "not-an-email")
+
+        assert isinstance(response, ContactPromptResponse)
+        assert "doesn't look like a valid email" in response.message
+        assert response.contact_name == "Yahav"
+
+    @pytest.mark.asyncio
+    async def test_multiple_unknown_contacts_one_at_a_time(self, contact_db):
+        """Multiple unknown contacts should be asked one at a time."""
+        from src.core.parser import ParsedEvent
+        from src.core.conflict_checker import ConflictResult
+
+        service, cal = _make_service_with_contacts(contact_db=contact_db)
+        cal.add_event = AsyncMock(return_value={"htmlLink": ""})
+
+        parsed = ParsedEvent(
+            event="Meeting", date="2026-02-08", time="14:00",
+            mentioned_contacts=["Yahav", "Dan"],
+        )
+
+        with patch("src.core.parser.parse_message", AsyncMock(return_value=[parsed])):
+            response = await service.process_text("Meeting with Yahav and Dan")
+
+        # First prompt for Yahav
+        assert isinstance(response, ContactPromptResponse)
+        assert response.contact_name == "Yahav"
+
+        # Resolve Yahav, should now prompt for Dan
+        no_conflict = ConflictResult(has_conflict=False)
+        with patch("src.core.conflict_checker.check_conflict", AsyncMock(return_value=no_conflict)):
+            response2 = await service.resolve_contact(response.pending, "yahav@gmail.com")
+
+        assert isinstance(response2, ContactPromptResponse)
+        assert response2.contact_name == "Dan"
+
+        # Resolve Dan, should create the event
+        with patch("src.core.conflict_checker.check_conflict", AsyncMock(return_value=no_conflict)):
+            response3 = await service.resolve_contact(response2.pending, "dan@example.com")
+
+        assert isinstance(response3, SuccessResponse)
+
+    @pytest.mark.asyncio
+    async def test_batch_mode_skips_unresolved(self, contact_db):
+        """In batch mode, unresolved contacts should fail with error message."""
+        from src.core.parser import ParsedEvent
+        from src.core.conflict_checker import ConflictResult
+
+        service, cal = _make_service_with_contacts(contact_db=contact_db)
+
+        actions = [
+            ParsedEvent(
+                event="Meeting with Yahav", date="2026-02-08", time="14:00",
+                mentioned_contacts=["Yahav"],
+            ),
+            ParsedEvent(
+                event="Lunch", date="2026-02-08", time="12:00",
+            ),
+        ]
+        no_conflict = ConflictResult(has_conflict=False)
+        cal.add_event = AsyncMock(return_value={"htmlLink": ""})
+
+        with patch("src.core.parser.parse_message", AsyncMock(return_value=actions)), \
+             patch("src.core.conflict_checker.check_conflict", AsyncMock(return_value=no_conflict)):
+            response = await service.process_text("Two things")
+
+        assert isinstance(response, BatchSummaryResponse)
+        # First action should fail (unknown Yahav)
+        assert not response.results[0].success
+        assert "Unknown contact" in response.results[0].error_message
+        # Second action (no contacts) should succeed
+        assert response.results[1].success
+
+    @pytest.mark.asyncio
+    async def test_batch_mode_auto_resolves_known(self, contact_db):
+        """In batch mode, known contacts should auto-resolve."""
+        from src.core.parser import ParsedEvent
+        from src.core.conflict_checker import ConflictResult
+
+        contact_db.add_contact("Yahav", "yahav@gmail.com")
+        service, cal = _make_service_with_contacts(contact_db=contact_db)
+        cal.add_event = AsyncMock(return_value={"htmlLink": ""})
+
+        actions = [
+            ParsedEvent(
+                event="Meeting with Yahav", date="2026-02-08", time="14:00",
+                mentioned_contacts=["Yahav"],
+            ),
+            ParsedEvent(
+                event="Lunch", date="2026-02-08", time="12:00",
+            ),
+        ]
+        no_conflict = ConflictResult(has_conflict=False)
+
+        with patch("src.core.parser.parse_message", AsyncMock(return_value=actions)), \
+             patch("src.core.conflict_checker.check_conflict", AsyncMock(return_value=no_conflict)):
+            response = await service.process_text("Two things")
+
+        assert isinstance(response, BatchSummaryResponse)
+        assert response.results[0].success
+        assert response.results[1].success
+
+    @pytest.mark.asyncio
+    async def test_no_contact_db_treats_all_as_unresolved(self):
+        """With no contact DB, all mentioned contacts are unresolved."""
+        from src.core.parser import ParsedEvent
+
+        service, cal = _make_service(MagicMock())
+
+        parsed = ParsedEvent(
+            event="Meeting", date="2026-02-08", time="14:00",
+            mentioned_contacts=["Yahav"],
+        )
+
+        with patch("src.core.parser.parse_message", AsyncMock(return_value=[parsed])):
+            response = await service.process_text("Meeting with Yahav")
+
+        assert isinstance(response, ContactPromptResponse)
+        assert response.contact_name == "Yahav"

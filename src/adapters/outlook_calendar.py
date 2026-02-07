@@ -17,8 +17,11 @@ from msgraph.generated.models.recurrence_pattern import RecurrencePattern
 from msgraph.generated.models.recurrence_pattern_type import RecurrencePatternType
 from msgraph.generated.models.recurrence_range import RecurrenceRange
 from msgraph.generated.models.recurrence_range_type import RecurrenceRangeType
-from msgraph.generated.models.item_body import ItemBody
+from msgraph.generated.models.attendee import Attendee
+from msgraph.generated.models.attendee_type import AttendeeType
 from msgraph.generated.models.body_type import BodyType
+from msgraph.generated.models.email_address import EmailAddress
+from msgraph.generated.models.item_body import ItemBody
 from msgraph.generated.users.item.calendar_view.calendar_view_request_builder import (
     CalendarViewRequestBuilder,
 )
@@ -83,6 +86,16 @@ class OutlookCalendarAdapter:
         )
         end_dt = start_dt + timedelta(minutes=parsed_event.duration_minutes)
 
+        attendees = None
+        if parsed_event.guests:
+            attendees = [
+                Attendee(
+                    email_address=EmailAddress(address=g),
+                    type=AttendeeType.Required,
+                )
+                for g in parsed_event.guests
+            ]
+
         event = Event(
             subject=parsed_event.event,
             body=ItemBody(content=parsed_event.description, content_type=BodyType.Text),
@@ -94,6 +107,7 @@ class OutlookCalendarAdapter:
                 date_time=end_dt.strftime("%Y-%m-%dT%H:%M:%S"),
                 time_zone=settings.TIMEZONE,
             ),
+            attendees=attendees,
         )
 
         try:

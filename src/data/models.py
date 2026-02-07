@@ -12,6 +12,20 @@ from dataclasses import dataclass, field
 
 
 @dataclass
+class Contact:
+    """A named contact for smart guest resolution.
+
+    When a user mentions a person's name in an event (e.g., "meeting with Yahav"),
+    the system looks up the name in the contacts DB to find the email address.
+    """
+
+    id: int
+    name: str              # original name, e.g. "Yahav"
+    email: str             # e.g. "yahav@gmail.com"
+    name_normalized: str   # lowercased for case-insensitive lookup
+
+
+@dataclass
 class Chore:
     """A recurring chore tracked by LifeOS.
 

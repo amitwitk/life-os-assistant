@@ -55,6 +55,7 @@ def _build_vevent(
     end_dt: datetime,
     uid: str | None = None,
     rrule: str | None = None,
+    attendees: list[str] | None = None,
 ) -> str:
     """Build an iCalendar VEVENT string."""
     cal = iCalendar()
@@ -75,6 +76,14 @@ def _build_vevent(
             key, _, value = part.partition("=")
             parts[key] = value
         event.add("rrule", parts)
+
+    if attendees:
+        from icalendar import vCalAddress
+        for email in attendees:
+            attendee = vCalAddress(f"MAILTO:{email}")
+            attendee.params["cn"] = email
+            attendee.params["ROLE"] = "REQ-PARTICIPANT"
+            event.add("attendee", attendee, encode=0)
 
     cal.add_component(event)
     return cal.to_ical().decode("utf-8")
@@ -148,6 +157,7 @@ class CalDAVCalendarAdapter:
             start_dt=start_dt,
             end_dt=end_dt,
             uid=uid,
+            attendees=parsed_event.guests or None,
         )
 
         try:

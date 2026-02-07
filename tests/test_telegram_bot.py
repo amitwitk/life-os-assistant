@@ -23,10 +23,12 @@ from src.core.action_service import (
     BatchSummaryResponse,
     ConflictOption,
     ConflictPromptResponse,
+    ContactPromptResponse,
     ErrorResponse,
     EventInfo,
     NoActionResponse,
     PendingBatchCancel,
+    PendingContactResolution,
     PendingEvent,
     QueryResultResponse,
     ResponseKind,
@@ -921,3 +923,125 @@ class TestBatchCancelCallback:
 
         update.callback_query.edit_message_text.assert_called_with("Batch cancel aborted.")
         assert "pending_batch_cancel" not in context.user_data
+
+
+# ---------------------------------------------------------------------------
+# Tests for contact email resolution
+# ---------------------------------------------------------------------------
+
+
+class TestContactEmailResolution:
+    @pytest.mark.asyncio
+    async def test_render_contact_prompt_stores_pending(self):
+        from src.bot.telegram_bot import _render_response
+
+        pending = PendingContactResolution(
+            action_type="create",
+            parsed_action_json={},
+            resolved_contacts={},
+            unresolved_contacts=["Yahav"],
+            current_asking="Yahav",
+        )
+        response = ContactPromptResponse(
+            kind=ResponseKind.CONTACT_PROMPT,
+            message="I don't have an email for *Yahav*. What's their email?",
+            contact_name="Yahav",
+            pending=pending,
+        )
+
+        update = _make_update("test")
+        context = _make_context()
+
+        await _render_response(response, update, context)
+
+        assert context.user_data["pending_contact"] is pending
+        assert context.user_data["awaiting_contact_email"] is True
+        call_text = update.message.reply_text.call_args[0][0]
+        assert "Yahav" in call_text
+
+    @pytest.mark.asyncio
+    async def test_process_text_intercepts_contact_email(self):
+        from src.bot.telegram_bot import _process_text
+
+        mock_service = _make_service()
+        mock_service.resolve_contact = AsyncMock(
+            return_value=SuccessResponse(
+                kind=ResponseKind.SUCCESS,
+                message="Event created!",
+            )
+        )
+
+        pending = PendingContactResolution(
+            action_type="create",
+            parsed_action_json={},
+            resolved_contacts={},
+            unresolved_contacts=["Yahav"],
+            current_asking="Yahav",
+        )
+
+        update = _make_update("yahav@gmail.com")
+        context = _make_context(service=mock_service)
+        context.user_data["awaiting_contact_email"] = True
+        context.user_data["pending_contact"] = pending
+
+        await _process_text("yahav@gmail.com", update, context)
+
+        mock_service.resolve_contact.assert_called_once_with(pending, "yahav@gmail.com")
+        assert "awaiting_contact_email" not in context.user_data
+        assert "pending_contact" not in context.user_data
+
+    @pytest.mark.asyncio
+    async def test_handle_contact_email_chained_prompts(self):
+        from src.bot.telegram_bot import _handle_contact_email
+
+        pending_initial = PendingContactResolution(
+            action_type="create",
+            parsed_action_json={},
+            resolved_contacts={},
+            unresolved_contacts=["Yahav", "Dan"],
+            current_asking="Yahav",
+        )
+
+        pending_next = PendingContactResolution(
+            action_type="create",
+            parsed_action_json={},
+            resolved_contacts={"Yahav": "yahav@gmail.com"},
+            unresolved_contacts=["Dan"],
+            current_asking="Dan",
+        )
+
+        mock_service = _make_service()
+        mock_service.resolve_contact = AsyncMock(
+            return_value=ContactPromptResponse(
+                kind=ResponseKind.CONTACT_PROMPT,
+                message="I don't have an email for *Dan*. What's their email?",
+                contact_name="Dan",
+                pending=pending_next,
+            )
+        )
+
+        update = _make_update("yahav@gmail.com")
+        context = _make_context(service=mock_service)
+        context.user_data["pending_contact"] = pending_initial
+
+        await _handle_contact_email("yahav@gmail.com", update, context)
+
+        # Should stay in the contact email flow
+        assert context.user_data["awaiting_contact_email"] is True
+        assert context.user_data["pending_contact"] is pending_next
+        call_text = update.message.reply_text.call_args[0][0]
+        assert "Dan" in call_text
+
+    @pytest.mark.asyncio
+    async def test_handle_contact_no_pending(self):
+        from src.bot.telegram_bot import _handle_contact_email
+
+        update = _make_update("yahav@gmail.com")
+        context = _make_context()
+        # No pending_contact set
+
+        await _handle_contact_email("yahav@gmail.com", update, context)
+
+        update.message.reply_text.assert_called_with(
+            "No pending contact resolution. Please start over."
+        )
