@@ -24,7 +24,7 @@ def _build_event_body(parsed_event: ParsedEvent) -> dict:
     )
     end_dt = start_dt + timedelta(minutes=parsed_event.duration_minutes)
 
-    return {
+    body = {
         "summary": parsed_event.event,
         "description": parsed_event.description,
         "start": {
@@ -36,6 +36,11 @@ def _build_event_body(parsed_event: ParsedEvent) -> dict:
             "timeZone": settings.TIMEZONE,
         },
     }
+
+    if parsed_event.guests:
+        body["attendees"] = [{"email": g} for g in parsed_event.guests]
+
+    return body
 
 
 class GoogleCalendarAdapter:
@@ -186,6 +191,31 @@ class GoogleCalendarAdapter:
         except Exception as exc:
             logger.error("Failed to update event with ID %s: %s", event_id, exc)
             raise CalendarError(f"Failed to update event: {exc}") from exc
+
+    async def add_guests(self, event_id: str, guests: list[str]) -> dict:
+        try:
+            service = get_calendar_service()
+            event = (
+                service.events()
+                .get(calendarId="primary", eventId=event_id)
+                .execute()
+            )
+            existing = event.get("attendees", [])
+            existing_emails = {a["email"] for a in existing}
+            for g in guests:
+                if g not in existing_emails:
+                    existing.append({"email": g})
+            event["attendees"] = existing
+            updated = (
+                service.events()
+                .update(calendarId="primary", eventId=event_id, body=event)
+                .execute()
+            )
+            logger.info("Added guests %s to event %s", guests, event_id)
+            return updated
+        except Exception as exc:
+            logger.error("Failed to add guests to event %s: %s", event_id, exc)
+            raise CalendarError(f"Failed to add guests: {exc}") from exc
 
     async def add_recurring_event(
         self,

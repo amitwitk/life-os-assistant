@@ -44,6 +44,7 @@ class ParsedEvent(BaseModel):
     time: str          # HH:MM in 24h format
     duration_minutes: int = 60
     description: str = ""
+    guests: list[str] = []
 
 
 class CancelEvent(BaseModel):
@@ -106,7 +107,24 @@ class CancelAllExcept(BaseModel):
     exceptions: list[str]  # event descriptions to KEEP
 
 
-ParserResponse = ParsedEvent | CancelEvent | RescheduleEvent | QueryEvents | CancelAllExcept
+class AddGuests(BaseModel):
+    """Add guests to an existing calendar event.
+
+    JSON example:
+    {
+        "intent": "add_guests",
+        "event_summary": "Meeting with Dan",
+        "date": "2025-02-14",
+        "guests": ["dan@email.com"]
+    }
+    """
+    intent: str = "add_guests"
+    event_summary: str
+    date: str          # ISO format YYYY-MM-DD
+    guests: list[str]  # list of email addresses
+
+
+ParserResponse = ParsedEvent | CancelEvent | RescheduleEvent | QueryEvents | CancelAllExcept | AddGuests
 
 
 # ---------------------------------------------------------------------------
@@ -124,11 +142,12 @@ Today's date is {today}.
 
 **Function 1: Create Event**
 If the user wants to schedule something, use this JSON schema:
-{{"intent": "create", "event": "string", "date": "YYYY-MM-DD", "time": "HH:MM", "duration_minutes": integer, "description": "string"}}
+{{"intent": "create", "event": "string", "date": "YYYY-MM-DD", "time": "HH:MM", "duration_minutes": integer, "description": "string", "guests": ["email@example.com"]}}
 
 - "event" = short title for the calendar event.
 - "time" must be in 24-hour format.
 - "duration_minutes" defaults to 60 if not mentioned.
+- "guests" = optional list of email addresses to invite. Default to [] if no guests are mentioned.
 - Interpret relative dates ("tomorrow", "next Monday") relative to today.
 
 **Function 2: Cancel Event**
@@ -160,6 +179,15 @@ If the user wants to cancel ALL events on a date EXCEPT specific ones (e.g., "ca
 
 - "date" = the date of the events.
 - "exceptions" = list of event descriptions that should NOT be canceled (the ones to keep).
+
+**Function 6: Add Guests**
+If the user wants to add guests/invitees to an EXISTING event (e.g., "Add dan@email.com to the meeting with Dan tomorrow"), use this JSON schema:
+{{"intent": "add_guests", "event_summary": "string", "date": "YYYY-MM-DD", "guests": ["email@example.com"]}}
+
+- "event_summary" = the name/summary of the existing event.
+- "date" = the date of the existing event.
+- "guests" = list of email addresses to add.
+- Only use this when the user explicitly asks to add guests to an EXISTING event. If they're creating a new event with guests, use Function 1 with the "guests" field instead.
 
 **General Rules:**
 - Support both Hebrew and English input.
@@ -287,6 +315,10 @@ def _instantiate_action(data: dict) -> ParserResponse | None:
     if intent == "cancel_all_except":
         parsed = CancelAllExcept(**data)
         logger.info("Parsed cancel-all-except on %s, keeping: %s", parsed.date, parsed.exceptions)
+        return parsed
+    if intent == "add_guests":
+        parsed = AddGuests(**data)
+        logger.info("Parsed add-guests to '%s' on %s: %s", parsed.event_summary, parsed.date, parsed.guests)
         return parsed
 
     _handle_unknown_intent(intent)

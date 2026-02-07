@@ -298,6 +298,76 @@ class TestOutlookAddRecurringEvent:
                 )
 
 
+class TestOutlookAddEventWithGuests:
+    @pytest.mark.asyncio
+    async def test_add_event_with_guests(self):
+        mock_client = MagicMock()
+        created_event = _mock_graph_event()
+        mock_client.me.events.post = AsyncMock(return_value=created_event)
+
+        with patch(_PATCH_CLIENT, return_value=mock_client), \
+             patch(_PATCH_SETTINGS) as mock_settings:
+            mock_settings.TIMEZONE = "Asia/Jerusalem"
+            adapter = OutlookCalendarAdapter()
+            from src.core.parser import ParsedEvent
+            parsed = ParsedEvent(event="Test", date="2026-02-14", time="10:00", guests=["a@test.com"])
+            await adapter.add_event(parsed)
+
+        call_arg = mock_client.me.events.post.call_args[0][0]
+        assert call_arg.attendees is not None
+        assert len(call_arg.attendees) == 1
+
+    @pytest.mark.asyncio
+    async def test_add_event_without_guests(self):
+        mock_client = MagicMock()
+        created_event = _mock_graph_event()
+        mock_client.me.events.post = AsyncMock(return_value=created_event)
+
+        with patch(_PATCH_CLIENT, return_value=mock_client), \
+             patch(_PATCH_SETTINGS) as mock_settings:
+            mock_settings.TIMEZONE = "Asia/Jerusalem"
+            adapter = OutlookCalendarAdapter()
+            from src.core.parser import ParsedEvent
+            parsed = ParsedEvent(event="Test", date="2026-02-14", time="10:00")
+            await adapter.add_event(parsed)
+
+        call_arg = mock_client.me.events.post.call_args[0][0]
+        assert call_arg.attendees is None
+
+
+class TestOutlookAddGuests:
+    @pytest.mark.asyncio
+    async def test_add_guests_success(self):
+        existing_event = MagicMock()
+        existing_event.attendees = []
+        updated_event = _mock_graph_event()
+
+        mock_client = MagicMock()
+        mock_client.me.events.by_event_id.return_value.get = AsyncMock(return_value=existing_event)
+        mock_client.me.events.by_event_id.return_value.patch = AsyncMock(return_value=updated_event)
+
+        with patch(_PATCH_CLIENT, return_value=mock_client):
+            adapter = OutlookCalendarAdapter()
+            result = await adapter.add_guests("evt1", ["new@test.com"])
+
+        assert result["id"] == "evt1"
+        patch_arg = mock_client.me.events.by_event_id.return_value.patch.call_args[0][0]
+        assert patch_arg.attendees is not None
+        assert len(patch_arg.attendees) == 1
+
+    @pytest.mark.asyncio
+    async def test_add_guests_failure(self):
+        mock_client = MagicMock()
+        mock_client.me.events.by_event_id.return_value.get = AsyncMock(
+            side_effect=Exception("fail")
+        )
+
+        with patch(_PATCH_CLIENT, return_value=mock_client):
+            adapter = OutlookCalendarAdapter()
+            with pytest.raises(CalendarError):
+                await adapter.add_guests("evt1", ["a@test.com"])
+
+
 class TestOutlookGetDailyEvents:
     @pytest.mark.asyncio
     async def test_delegates_to_find_events(self):

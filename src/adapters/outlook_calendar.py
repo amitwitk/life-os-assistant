@@ -19,6 +19,9 @@ from msgraph.generated.models.recurrence_range import RecurrenceRange
 from msgraph.generated.models.recurrence_range_type import RecurrenceRangeType
 from msgraph.generated.models.item_body import ItemBody
 from msgraph.generated.models.body_type import BodyType
+from msgraph.generated.models.attendee import Attendee
+from msgraph.generated.models.attendee_type import AttendeeType
+from msgraph.generated.models.email_address import EmailAddress
 from msgraph.generated.users.item.calendar_view.calendar_view_request_builder import (
     CalendarViewRequestBuilder,
 )
@@ -83,6 +86,16 @@ class OutlookCalendarAdapter:
         )
         end_dt = start_dt + timedelta(minutes=parsed_event.duration_minutes)
 
+        attendees = None
+        if parsed_event.guests:
+            attendees = [
+                Attendee(
+                    email_address=EmailAddress(address=g),
+                    type=AttendeeType.Required,
+                )
+                for g in parsed_event.guests
+            ]
+
         event = Event(
             subject=parsed_event.event,
             body=ItemBody(content=parsed_event.description, content_type=BodyType.Text),
@@ -94,6 +107,7 @@ class OutlookCalendarAdapter:
                 date_time=end_dt.strftime("%Y-%m-%dT%H:%M:%S"),
                 time_zone=settings.TIMEZONE,
             ),
+            attendees=attendees,
         )
 
         try:
@@ -198,6 +212,34 @@ class OutlookCalendarAdapter:
         except Exception as exc:
             logger.error("Outlook API error (update_event): %s", exc)
             raise CalendarError(f"Failed to update event: {exc}") from exc
+
+    async def add_guests(self, event_id: str, guests: list[str]) -> dict:
+        try:
+            client = get_graph_client()
+            existing = await client.me.events.by_event_id(event_id).get()
+
+            current_attendees = list(existing.attendees or [])
+            existing_emails = {
+                a.email_address.address
+                for a in current_attendees
+                if a.email_address and a.email_address.address
+            }
+            for g in guests:
+                if g not in existing_emails:
+                    current_attendees.append(
+                        Attendee(
+                            email_address=EmailAddress(address=g),
+                            type=AttendeeType.Required,
+                        )
+                    )
+
+            patch_event = Event(attendees=current_attendees)
+            updated = await client.me.events.by_event_id(event_id).patch(patch_event)
+            logger.info("Added guests %s to Outlook event %s", guests, event_id)
+            return _normalize_event(updated)
+        except Exception as exc:
+            logger.error("Outlook API error (add_guests): %s", exc)
+            raise CalendarError(f"Failed to add guests: {exc}") from exc
 
     async def add_recurring_event(
         self,

@@ -64,6 +64,25 @@ class TestBuildEventBody:
         assert "2026-02-14T14:00:00" in body["start"]["dateTime"]
         assert "2026-02-14T15:00:00" in body["end"]["dateTime"]
 
+    def test_builds_body_with_guests(self):
+        parsed = ParsedEvent(
+            event="Meeting", date="2026-02-14", time="14:00",
+            duration_minutes=60, description="", guests=["a@test.com", "b@test.com"],
+        )
+        body = _build_event_body(parsed)
+        assert "attendees" in body
+        assert len(body["attendees"]) == 2
+        assert body["attendees"][0] == {"email": "a@test.com"}
+        assert body["attendees"][1] == {"email": "b@test.com"}
+
+    def test_builds_body_without_guests(self):
+        parsed = ParsedEvent(
+            event="Meeting", date="2026-02-14", time="14:00",
+            duration_minutes=60, description="",
+        )
+        body = _build_event_body(parsed)
+        assert "attendees" not in body
+
 
 # ---------------------------------------------------------------------------
 # Tests for add_event
@@ -206,3 +225,47 @@ class TestAddRecurringEvent:
                     start_date="2026-02-08", start_time="10:00", end_time="10:30",
                     frequency_days=7, occurrences=4,
                 )
+
+
+# ---------------------------------------------------------------------------
+# Tests for add_guests
+# ---------------------------------------------------------------------------
+
+
+class TestAddGuests:
+    @pytest.mark.asyncio
+    async def test_add_guests_success(self):
+        mock_svc = _mock_service(execute_return={
+            "id": "evt1", "attendees": [{"email": "existing@test.com"}, {"email": "new@test.com"}],
+        })
+        with patch(_PATCH_GCS, return_value=mock_svc):
+            from src.integrations.gcal_service import add_guests
+            result = await add_guests("evt1", ["new@test.com"])
+        assert result["id"] == "evt1"
+        mock_svc.events.return_value.update.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_add_guests_deduplicates(self):
+        mock_svc = _mock_service(execute_return={
+            "id": "evt1", "attendees": [{"email": "a@test.com"}],
+        })
+        # get returns event with existing attendee
+        mock_svc.events.return_value.get.return_value.execute.return_value = {
+            "id": "evt1", "attendees": [{"email": "a@test.com"}],
+        }
+        with patch(_PATCH_GCS, return_value=mock_svc):
+            from src.integrations.gcal_service import add_guests
+            await add_guests("evt1", ["a@test.com", "b@test.com"])
+        call_body = mock_svc.events.return_value.update.call_args[1]["body"]
+        emails = [a["email"] for a in call_body["attendees"]]
+        assert emails.count("a@test.com") == 1
+        assert "b@test.com" in emails
+
+    @pytest.mark.asyncio
+    async def test_add_guests_failure(self):
+        mock_svc = MagicMock()
+        mock_svc.events.return_value.get.return_value.execute.side_effect = Exception("fail")
+        with patch(_PATCH_GCS, return_value=mock_svc):
+            from src.integrations.gcal_service import add_guests
+            with pytest.raises(CalendarError):
+                await add_guests("evt1", ["a@test.com"])
