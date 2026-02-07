@@ -24,7 +24,7 @@ def _build_event_body(parsed_event: ParsedEvent) -> dict:
     )
     end_dt = start_dt + timedelta(minutes=parsed_event.duration_minutes)
 
-    body = {
+    body: dict = {
         "summary": parsed_event.event,
         "description": parsed_event.description,
         "start": {
@@ -36,10 +36,8 @@ def _build_event_body(parsed_event: ParsedEvent) -> dict:
             "timeZone": settings.TIMEZONE,
         },
     }
-
     if parsed_event.guests:
         body["attendees"] = [{"email": g} for g in parsed_event.guests]
-
     return body
 
 

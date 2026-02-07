@@ -20,6 +20,7 @@ from typing import TYPE_CHECKING
 from src.ports.calendar_port import CalendarError
 
 if TYPE_CHECKING:
+    from src.data.db import ContactDB
     from src.data.models import Chore
     from src.ports.calendar_port import CalendarPort
 
@@ -35,6 +36,7 @@ class ResponseKind(Enum):
     SUCCESS = "success"
     ERROR = "error"
     CONFLICT_PROMPT = "conflict_prompt"
+    CONTACT_PROMPT = "contact_prompt"
     BATCH_CANCEL_PROMPT = "batch_cancel_prompt"
     QUERY_RESULT = "query_result"
     BATCH_SUMMARY = "batch_summary"
@@ -128,6 +130,21 @@ class BatchSummaryResponse(ServiceResponse):
     results: list[ActionResult] = field(default_factory=list)
 
 
+@dataclass
+class PendingContactResolution:
+    action_type: str                                     # "create"
+    parsed_action_json: dict = field(default_factory=dict)  # ParsedEvent.model_dump()
+    resolved_contacts: dict = field(default_factory=dict)   # name → email
+    unresolved_contacts: list = field(default_factory=list)  # names needing emails
+    current_asking: str = ""                              # which name we're asking about
+
+
+@dataclass
+class ContactPromptResponse(ServiceResponse):
+    contact_name: str = ""
+    pending: PendingContactResolution | None = None
+
+
 # ---------------------------------------------------------------------------
 # ActionService
 # ---------------------------------------------------------------------------
@@ -139,8 +156,9 @@ class ActionService:
     Returns structured response objects — never sends messages directly.
     """
 
-    def __init__(self, calendar: CalendarPort) -> None:
+    def __init__(self, calendar: CalendarPort, contact_db: ContactDB | None = None) -> None:
         self._calendar = calendar
+        self._contact_db = contact_db
 
     # ------------------------------------------------------------------
     # Public: process free-text
@@ -524,6 +542,86 @@ class ActionService:
         return db.mark_done(chore_id)
 
     # ------------------------------------------------------------------
+    # Public: contact resolution
+    # ------------------------------------------------------------------
+
+    def _resolve_contacts(
+        self, mentioned_contacts: list[str], existing_guests: list[str],
+    ) -> tuple[dict[str, str], list[str]]:
+        """Look up mentioned contact names in the contacts DB.
+
+        Returns (resolved: {name: email}, unresolved: [name, ...]).
+        """
+        resolved: dict[str, str] = {}
+        unresolved: list[str] = []
+
+        if not self._contact_db:
+            return resolved, mentioned_contacts
+
+        existing_lower = {e.lower() for e in existing_guests}
+
+        for name in mentioned_contacts:
+            contact = self._contact_db.find_by_name(name)
+            if contact and contact.email.lower() not in existing_lower:
+                resolved[name] = contact.email
+            elif contact:
+                # Already in guests list
+                resolved[name] = contact.email
+            else:
+                unresolved.append(name)
+
+        return resolved, unresolved
+
+    async def resolve_contact(
+        self,
+        pending: PendingContactResolution,
+        email: str,
+    ) -> ServiceResponse:
+        """Resolve a pending contact by saving the email and continuing.
+
+        Validates email format, saves to DB, then either asks for the next
+        unknown contact or re-executes the original action.
+        """
+        email = email.strip()
+        if not re.match(r"^[^@\s]+@[^@\s]+\.[^@\s]+$", email):
+            return ContactPromptResponse(
+                kind=ResponseKind.CONTACT_PROMPT,
+                message=f"'{email}' doesn't look like a valid email. What's the email for {pending.current_asking}?",
+                contact_name=pending.current_asking,
+                pending=pending,
+            )
+
+        # Save contact to DB
+        if self._contact_db:
+            self._contact_db.add_contact(pending.current_asking, email)
+
+        # Move from unresolved → resolved
+        pending.resolved_contacts[pending.current_asking] = email
+        pending.unresolved_contacts.remove(pending.current_asking)
+
+        # If more unresolved contacts, ask for the next one
+        if pending.unresolved_contacts:
+            next_name = pending.unresolved_contacts[0]
+            pending.current_asking = next_name
+            return ContactPromptResponse(
+                kind=ResponseKind.CONTACT_PROMPT,
+                message=f"I don't have an email for *{next_name}*. What's their email?",
+                contact_name=next_name,
+                pending=pending,
+            )
+
+        # All resolved — rebuild the parsed action with guests and re-execute
+        all_emails = list(pending.resolved_contacts.values())
+        existing_guests = pending.parsed_action_json.get("guests", [])
+        merged = list({e.lower(): e for e in existing_guests + all_emails}.values())
+        pending.parsed_action_json["guests"] = merged
+        pending.parsed_action_json["mentioned_contacts"] = []
+
+        from src.core.parser import ParsedEvent
+        parsed = ParsedEvent(**pending.parsed_action_json)
+        return await self._execute_single_action(parsed)
+
+    # ------------------------------------------------------------------
     # Internal: single-action execution
     # ------------------------------------------------------------------
 
@@ -536,6 +634,33 @@ class ActionService:
         )
 
         if isinstance(parsed, ParsedEvent):
+            # --- Contact resolution ---
+            if parsed.mentioned_contacts:
+                resolved, unresolved = self._resolve_contacts(
+                    parsed.mentioned_contacts, parsed.guests,
+                )
+                if unresolved:
+                    first_unknown = unresolved[0]
+                    pending = PendingContactResolution(
+                        action_type="create",
+                        parsed_action_json=parsed.model_dump(),
+                        resolved_contacts=resolved,
+                        unresolved_contacts=unresolved,
+                        current_asking=first_unknown,
+                    )
+                    return ContactPromptResponse(
+                        kind=ResponseKind.CONTACT_PROMPT,
+                        message=f"I don't have an email for *{first_unknown}*. What's their email?",
+                        contact_name=first_unknown,
+                        pending=pending,
+                    )
+                # All contacts resolved — merge emails into guests
+                all_emails = list(resolved.values())
+                existing = parsed.guests
+                merged = list({e.lower(): e for e in existing + all_emails}.values())
+                parsed = parsed.model_copy(update={"guests": merged, "mentioned_contacts": []})
+
+            # --- Conflict check ---
             conflict = await check_conflict(
                 self._calendar, parsed.date, parsed.time, parsed.duration_minutes,
             )
@@ -865,6 +990,25 @@ class ActionService:
         other_results_map: dict[int, ActionResult] = {}
         for idx, action in other_actions:
             if isinstance(action, ParsedEvent):
+                # In batch mode: auto-resolve known contacts, skip unknown
+                if action.mentioned_contacts:
+                    resolved, unresolved = self._resolve_contacts(
+                        action.mentioned_contacts, action.guests,
+                    )
+                    if unresolved:
+                        names = ", ".join(unresolved)
+                        other_results_map[idx] = ActionResult(
+                            action_type="create",
+                            summary=action.event,
+                            success=False,
+                            error_message=f"Unknown contact: {names}",
+                        )
+                        continue
+                    all_emails = list(resolved.values())
+                    existing = action.guests
+                    merged = list({e.lower(): e for e in existing + all_emails}.values())
+                    action = action.model_copy(update={"guests": merged, "mentioned_contacts": []})
+
                 try:
                     conflict = await check_conflict(
                         self._calendar, action.date, action.time, action.duration_minutes,
