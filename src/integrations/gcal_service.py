@@ -28,6 +28,7 @@ __all__ = [
     "delete_event",
     "add_recurring_event",
     "update_event",
+    "add_guests",
 ]
 
 _adapter = GoogleCalendarAdapter()
@@ -79,3 +80,8 @@ async def add_recurring_event(
         frequency_days=frequency_days,
         occurrences=occurrences,
     )
+
+
+async def add_guests(event_id: str, guests: list[str]) -> dict:
+    """Deprecated: use CalendarPort.add_guests instead."""
+    return await _adapter.add_guests(event_id, guests)

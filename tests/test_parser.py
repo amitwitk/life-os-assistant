@@ -9,6 +9,7 @@ from src.core.parser import (
     CancelAllExcept,
     RescheduleEvent,
     QueryEvents,
+    AddGuests,
     parse_message,
     match_event,
     batch_match_events,
@@ -298,6 +299,50 @@ class TestBatchExcludeEvents:
         ]
         result = await batch_exclude_events([], events)
         assert len(result) == 2
+
+
+# ---------------------------------------------------------------------------
+# Tests for guest parsing
+# ---------------------------------------------------------------------------
+
+
+class TestGuestParsing:
+    @pytest.mark.asyncio
+    async def test_parse_create_with_guests(self):
+        llm_response = '[{"intent": "create", "event": "Meeting with Dan", "date": "2026-02-14", "time": "14:00", "duration_minutes": 60, "description": "", "guests": ["dan@email.com"]}]'
+        with patch("src.core.parser.complete", AsyncMock(return_value=llm_response)):
+            result = await parse_message("Meeting with Dan tomorrow at 14:00, invite dan@email.com")
+        assert len(result) == 1
+        assert isinstance(result[0], ParsedEvent)
+        assert result[0].guests == ["dan@email.com"]
+
+    @pytest.mark.asyncio
+    async def test_parse_create_without_guests(self):
+        llm_response = '[{"intent": "create", "event": "Dentist", "date": "2026-02-14", "time": "16:00", "duration_minutes": 60, "description": ""}]'
+        with patch("src.core.parser.complete", AsyncMock(return_value=llm_response)):
+            result = await parse_message("Dentist tomorrow at 4pm")
+        assert len(result) == 1
+        assert isinstance(result[0], ParsedEvent)
+        assert result[0].guests == []
+
+    @pytest.mark.asyncio
+    async def test_parse_add_guests_intent(self):
+        llm_response = '[{"intent": "add_guests", "event_summary": "Meeting with Dan", "date": "2026-02-14", "guests": ["shon@email.com"]}]'
+        with patch("src.core.parser.complete", AsyncMock(return_value=llm_response)):
+            result = await parse_message("Add shon@email.com to the meeting with Dan tomorrow")
+        assert len(result) == 1
+        assert isinstance(result[0], AddGuests)
+        assert result[0].event_summary == "Meeting with Dan"
+        assert result[0].guests == ["shon@email.com"]
+
+    @pytest.mark.asyncio
+    async def test_parse_add_guests_multiple(self):
+        llm_response = '[{"intent": "add_guests", "event_summary": "Team standup", "date": "2026-02-14", "guests": ["a@test.com", "b@test.com"]}]'
+        with patch("src.core.parser.complete", AsyncMock(return_value=llm_response)):
+            result = await parse_message("Add a@test.com and b@test.com to standup tomorrow")
+        assert len(result) == 1
+        assert isinstance(result[0], AddGuests)
+        assert len(result[0].guests) == 2
 
 
 # ---------------------------------------------------------------------------

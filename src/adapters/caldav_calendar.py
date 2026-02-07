@@ -15,6 +15,7 @@ from datetime import date, datetime, timedelta
 import caldav
 from icalendar import Calendar as iCalendar
 from icalendar import Event as iEvent
+from icalendar import vCalAddress
 
 from src.config import settings
 from src.core.parser import ParsedEvent
@@ -78,12 +79,10 @@ def _build_vevent(
         event.add("rrule", parts)
 
     if attendees:
-        from icalendar import vCalAddress
         for email in attendees:
-            attendee = vCalAddress(f"MAILTO:{email}")
-            attendee.params["cn"] = email
+            attendee = vCalAddress(f"mailto:{email}")
             attendee.params["ROLE"] = "REQ-PARTICIPANT"
-            event.add("attendee", attendee, encode=0)
+            event.add("attendee", attendee)
 
     cal.add_component(event)
     return cal.to_ical().decode("utf-8")
@@ -299,6 +298,46 @@ class CalDAVCalendarAdapter:
         except Exception as exc:
             logger.error("CalDAV error (update_event): %s", exc)
             raise CalendarError(f"Failed to update event: {exc}") from exc
+
+    async def add_guests(self, event_id: str, guests: list[str]) -> dict:
+        try:
+            cal = await asyncio.to_thread(_get_calendar)
+            results = await asyncio.to_thread(
+                cal.search, start=datetime(2000, 1, 1), end=datetime(2099, 12, 31), event=True
+            )
+
+            for ev in results:
+                parsed = _parse_vevent(ev)
+                if parsed["id"] != event_id:
+                    continue
+
+                ical = iCalendar.from_ical(ev.data)
+                for component in ical.walk():
+                    if component.name != "VEVENT":
+                        continue
+
+                    existing_emails = set()
+                    for att in component.get("attendee", []):
+                        email = str(att).replace("mailto:", "")
+                        existing_emails.add(email)
+
+                    for email in guests:
+                        if email not in existing_emails:
+                            attendee = vCalAddress(f"mailto:{email}")
+                            attendee.params["ROLE"] = "REQ-PARTICIPANT"
+                            component.add("attendee", attendee)
+
+                    ev.data = ical.to_ical().decode("utf-8")
+                    await asyncio.to_thread(ev.save)
+                    logger.info("Added guests %s to CalDAV event %s", guests, event_id)
+                    return _parse_vevent(ev)
+
+            raise CalendarError(f"Event with UID {event_id} not found.")
+        except CalendarError:
+            raise
+        except Exception as exc:
+            logger.error("CalDAV error (add_guests): %s", exc)
+            raise CalendarError(f"Failed to add guests: {exc}") from exc
 
     async def add_recurring_event(
         self,
