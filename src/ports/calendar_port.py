@@ -43,3 +43,7 @@ class CalendarPort(Protocol):
     async def get_daily_events(
         self, target_date: str | None = None
     ) -> list[dict]: ...
+
+    async def add_guests(
+        self, event_id: str, guests: list[str]
+    ) -> dict: ...

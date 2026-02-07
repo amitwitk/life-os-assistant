@@ -74,7 +74,7 @@ class PendingBatchCancel:
 
 @dataclass
 class ActionResult:
-    action_type: str   # "create" | "cancel" | "reschedule" | "query" | "cancel_all_except"
+    action_type: str   # "create" | "cancel" | "reschedule" | "query" | "cancel_all_except" | "add_guests"
     summary: str
     success: bool
     error_message: str = ""
@@ -531,8 +531,8 @@ class ActionService:
         """Execute a single parsed action with full interactive flow."""
         from src.core.conflict_checker import check_conflict, extract_event_duration_minutes
         from src.core.parser import (
-            CancelAllExcept, CancelEvent, ParsedEvent, QueryEvents, RescheduleEvent,
-            batch_exclude_events, match_event,
+            AddGuests, CancelAllExcept, CancelEvent, ParsedEvent, QueryEvents,
+            RescheduleEvent, batch_exclude_events, match_event,
         )
 
         if isinstance(parsed, ParsedEvent):
@@ -745,6 +745,39 @@ class ActionService:
                     message="Something went wrong while processing your request. Please try again later.",
                 )
 
+        elif isinstance(parsed, AddGuests):
+            try:
+                all_events = await self._calendar.find_events(target_date=parsed.date)
+                if not all_events:
+                    return ErrorResponse(
+                        kind=ResponseKind.ERROR,
+                        message=f"There are no events on {parsed.date} to add guests to.",
+                    )
+
+                matched = await match_event(parsed.event_summary, all_events)
+                if matched is None:
+                    summaries = ", ".join(ev["summary"] for ev in all_events)
+                    return ErrorResponse(
+                        kind=ResponseKind.ERROR,
+                        message=(
+                            f"I couldn't match '{parsed.event_summary}' to any event on {parsed.date}.\n"
+                            f"Events that day: {summaries}"
+                        ),
+                    )
+
+                updated = await self._calendar.add_guests(matched["id"], parsed.guests)
+                guests_str = ", ".join(parsed.guests)
+                return SuccessResponse(
+                    kind=ResponseKind.SUCCESS,
+                    message=f"\u2705 Added {guests_str} to *{matched['summary']}*",
+                )
+            except CalendarError as exc:
+                logger.error("Calendar add_guests error: %s", exc)
+                return ErrorResponse(
+                    kind=ResponseKind.ERROR,
+                    message="I found the event but couldn't add guests. Please try again later.",
+                )
+
         return ErrorResponse(
             kind=ResponseKind.ERROR,
             message="Unknown action type.",
@@ -758,8 +791,8 @@ class ActionService:
         """Process multiple actions sequentially, collecting results for a summary."""
         from src.core.conflict_checker import check_conflict, extract_event_duration_minutes
         from src.core.parser import (
-            CancelAllExcept, CancelEvent, ParsedEvent, QueryEvents, RescheduleEvent,
-            batch_exclude_events, batch_match_events, match_event,
+            AddGuests, CancelAllExcept, CancelEvent, ParsedEvent, QueryEvents,
+            RescheduleEvent, batch_exclude_events, batch_match_events, match_event,
         )
 
         results: list[ActionResult] = []
@@ -952,6 +985,31 @@ class ActionService:
                     other_results_map[idx] = ActionResult(
                         action_type="cancel_all_except",
                         summary="Cancel all except",
+                        success=False, error_message=str(exc),
+                    )
+            elif isinstance(action, AddGuests):
+                try:
+                    all_events = await self._calendar.find_events(target_date=action.date)
+                    matched_ev = await match_event(action.event_summary, all_events) if all_events else None
+                    if matched_ev is None:
+                        other_results_map[idx] = ActionResult(
+                            action_type="add_guests",
+                            summary=action.event_summary,
+                            success=False, error_message="Could not find matching event",
+                        )
+                        continue
+
+                    await self._calendar.add_guests(matched_ev["id"], action.guests)
+                    guests_str = ", ".join(action.guests)
+                    other_results_map[idx] = ActionResult(
+                        action_type="add_guests",
+                        summary=f"Added {guests_str} to {matched_ev.get('summary', action.event_summary)}",
+                        success=True,
+                    )
+                except CalendarError as exc:
+                    other_results_map[idx] = ActionResult(
+                        action_type="add_guests",
+                        summary=action.event_summary,
                         success=False, error_message=str(exc),
                     )
 

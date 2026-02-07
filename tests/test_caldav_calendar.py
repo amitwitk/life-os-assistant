@@ -101,6 +101,27 @@ class TestBuildVevent:
         )
         assert "INTERVAL" in result
 
+    def test_builds_vevent_with_attendees(self):
+        result = _build_vevent(
+            summary="Meeting",
+            description="",
+            start_dt=datetime(2026, 2, 14, 10, 0),
+            end_dt=datetime(2026, 2, 14, 11, 0),
+            attendees=["a@test.com", "b@test.com"],
+        )
+        assert "ATTENDEE" in result
+        assert "mailto:a@test.com" in result
+        assert "mailto:b@test.com" in result
+
+    def test_builds_vevent_without_attendees(self):
+        result = _build_vevent(
+            summary="Meeting",
+            description="",
+            start_dt=datetime(2026, 2, 14, 10, 0),
+            end_dt=datetime(2026, 2, 14, 11, 0),
+        )
+        assert "ATTENDEE" not in result
+
 
 # ---------------------------------------------------------------------------
 # Tests for _parse_vevent
@@ -360,6 +381,72 @@ class TestCalDAVAddRecurringEvent:
                     frequency_days=7,
                     occurrences=4,
                 )
+
+
+class TestCalDAVAddEventWithGuests:
+    @pytest.mark.asyncio
+    async def test_add_event_with_guests(self):
+        mock_cal = MagicMock()
+        mock_cal.save_event = MagicMock()
+
+        with patch(_PATCH_GET_CAL, return_value=mock_cal):
+            adapter = CalDAVCalendarAdapter()
+            from src.core.parser import ParsedEvent
+            parsed = ParsedEvent(event="Meeting", date="2026-02-14", time="10:00", guests=["a@test.com"])
+            await adapter.add_event(parsed)
+
+        saved_ical = mock_cal.save_event.call_args[0][0]
+        assert "ATTENDEE" in saved_ical
+        assert "mailto:a@test.com" in saved_ical
+
+    @pytest.mark.asyncio
+    async def test_add_event_without_guests(self):
+        mock_cal = MagicMock()
+        mock_cal.save_event = MagicMock()
+
+        with patch(_PATCH_GET_CAL, return_value=mock_cal):
+            adapter = CalDAVCalendarAdapter()
+            from src.core.parser import ParsedEvent
+            parsed = ParsedEvent(event="Meeting", date="2026-02-14", time="10:00")
+            await adapter.add_event(parsed)
+
+        saved_ical = mock_cal.save_event.call_args[0][0]
+        assert "ATTENDEE" not in saved_ical
+
+
+class TestCalDAVAddGuests:
+    @pytest.mark.asyncio
+    async def test_add_guests_success(self):
+        ev = _make_caldav_event(uid="guest-uid")
+        mock_cal = MagicMock()
+        mock_cal.search = MagicMock(return_value=[ev])
+
+        with patch(_PATCH_GET_CAL, return_value=mock_cal):
+            adapter = CalDAVCalendarAdapter()
+            result = await adapter.add_guests("guest-uid", ["new@test.com"])
+
+        assert result["id"] == "guest-uid"
+        ev.save.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_add_guests_not_found(self):
+        mock_cal = MagicMock()
+        mock_cal.search = MagicMock(return_value=[])
+
+        with patch(_PATCH_GET_CAL, return_value=mock_cal):
+            adapter = CalDAVCalendarAdapter()
+            with pytest.raises(CalendarError, match="not found"):
+                await adapter.add_guests("nonexistent-uid", ["a@test.com"])
+
+    @pytest.mark.asyncio
+    async def test_add_guests_failure(self):
+        mock_cal = MagicMock()
+        mock_cal.search = MagicMock(side_effect=Exception("fail"))
+
+        with patch(_PATCH_GET_CAL, return_value=mock_cal):
+            adapter = CalDAVCalendarAdapter()
+            with pytest.raises(CalendarError):
+                await adapter.add_guests("uid", ["a@test.com"])
 
 
 class TestCalDAVGetDailyEvents:

@@ -757,3 +757,109 @@ class TestChoreOperations:
             )
 
         assert result == mock_slot
+
+
+# ---------------------------------------------------------------------------
+# process_text — add guests
+# ---------------------------------------------------------------------------
+
+
+class TestProcessTextAddGuests:
+    @pytest.mark.asyncio
+    async def test_add_guests_success(self):
+        from src.core.parser import AddGuests
+
+        service, cal = _make_service()
+        events = [{"summary": "Meeting with Dan", "id": "ev1"}]
+        cal.find_events = AsyncMock(return_value=events)
+        cal.add_guests = AsyncMock(return_value={"id": "ev1", "summary": "Meeting with Dan"})
+
+        parsed = AddGuests(event_summary="Meeting with Dan", date="2026-02-08", guests=["dan@email.com"])
+
+        with patch("src.core.parser.parse_message", AsyncMock(return_value=[parsed])), \
+             patch("src.core.parser.match_event", AsyncMock(return_value=events[0])):
+            response = await service.process_text("Add dan@email.com to meeting with Dan")
+
+        assert isinstance(response, SuccessResponse)
+        assert "dan@email.com" in response.message
+        assert "Meeting with Dan" in response.message
+        cal.add_guests.assert_called_once_with("ev1", ["dan@email.com"])
+
+    @pytest.mark.asyncio
+    async def test_add_guests_no_match(self):
+        from src.core.parser import AddGuests
+
+        service, cal = _make_service()
+        events = [{"summary": "Padel game", "id": "ev1"}]
+        cal.find_events = AsyncMock(return_value=events)
+
+        parsed = AddGuests(event_summary="Meeting with Dan", date="2026-02-08", guests=["dan@email.com"])
+
+        with patch("src.core.parser.parse_message", AsyncMock(return_value=[parsed])), \
+             patch("src.core.parser.match_event", AsyncMock(return_value=None)):
+            response = await service.process_text("Add dan@email.com to meeting with Dan")
+
+        assert isinstance(response, ErrorResponse)
+        assert "couldn't match" in response.message.lower()
+
+    @pytest.mark.asyncio
+    async def test_add_guests_no_events_on_date(self):
+        from src.core.parser import AddGuests
+
+        service, cal = _make_service()
+        cal.find_events = AsyncMock(return_value=[])
+
+        parsed = AddGuests(event_summary="Meeting", date="2026-02-08", guests=["dan@email.com"])
+
+        with patch("src.core.parser.parse_message", AsyncMock(return_value=[parsed])):
+            response = await service.process_text("Add dan@email.com to meeting")
+
+        assert isinstance(response, ErrorResponse)
+        assert "no events" in response.message.lower()
+
+    @pytest.mark.asyncio
+    async def test_add_guests_calendar_error(self):
+        from src.core.parser import AddGuests
+        from src.ports.calendar_port import CalendarError
+
+        service, cal = _make_service()
+        events = [{"summary": "Meeting", "id": "ev1"}]
+        cal.find_events = AsyncMock(return_value=events)
+        cal.add_guests = AsyncMock(side_effect=CalendarError("API error"))
+
+        parsed = AddGuests(event_summary="Meeting", date="2026-02-08", guests=["dan@email.com"])
+
+        with patch("src.core.parser.parse_message", AsyncMock(return_value=[parsed])), \
+             patch("src.core.parser.match_event", AsyncMock(return_value=events[0])):
+            response = await service.process_text("Add dan@email.com to meeting")
+
+        assert isinstance(response, ErrorResponse)
+        assert "couldn't add guests" in response.message.lower()
+
+    @pytest.mark.asyncio
+    async def test_add_guests_batch(self):
+        from src.core.parser import AddGuests, ParsedEvent
+        from src.core.conflict_checker import ConflictResult
+
+        service, cal = _make_service()
+        events = [{"summary": "Meeting", "id": "ev1"}]
+        cal.find_events = AsyncMock(return_value=events)
+        cal.add_guests = AsyncMock(return_value={"id": "ev1"})
+        cal.add_event = AsyncMock(return_value={"htmlLink": ""})
+
+        actions = [
+            ParsedEvent(event="Lunch", date="2026-02-08", time="12:00"),
+            AddGuests(event_summary="Meeting", date="2026-02-08", guests=["dan@email.com"]),
+        ]
+        no_conflict = ConflictResult(has_conflict=False)
+
+        with patch("src.core.parser.parse_message", AsyncMock(return_value=actions)), \
+             patch("src.core.conflict_checker.check_conflict", AsyncMock(return_value=no_conflict)), \
+             patch("src.core.parser.match_event", AsyncMock(return_value=events[0])):
+            response = await service.process_text("Create lunch at 12 and add dan@email.com to meeting")
+
+        assert isinstance(response, BatchSummaryResponse)
+        assert len(response.results) == 2
+        assert response.results[0].action_type == "create"
+        assert response.results[1].action_type == "add_guests"
+        assert all(r.success for r in response.results)
