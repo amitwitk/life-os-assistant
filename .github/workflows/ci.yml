@@ -10,6 +10,23 @@ jobs:
   test:
     runs-on: ubuntu-latest
 
+    strategy:
+      fail-fast: false
+      matrix:
+        module:
+          - test_parser
+          - test_telegram_bot
+          - test_conflict_checker
+          - test_chore_scheduler
+          - test_gcal_service
+          - test_outlook_calendar
+          - test_caldav_calendar
+          - test_calendar_factory
+          - test_db
+          - test_models
+
+    name: test-${{ matrix.module }}
+
     env:
       TELEGRAM_BOT_TOKEN: fake-token-for-ci
       LLM_API_KEY: fake-llm-key-for-ci
@@ -31,5 +48,5 @@ jobs:
           pip install -r requirements.txt
           pip install -r requirements-dev.txt
 
-      - name: Run tests
-        run: pytest -v
+      - name: Run tests — ${{ matrix.module }}
+        run: pytest tests/${{ matrix.module }}.py -v
