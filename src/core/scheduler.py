@@ -30,21 +30,57 @@ logger = logging.getLogger(__name__)
 
 
 async def send_morning_summary(
-    calendar: CalendarPort,
     notifier: NotificationPort,
+    user_db: object | None = None,
+    calendar: CalendarPort | None = None,
 ) -> None:
-    """Send the morning briefing to all allowed users via the notifier."""
-    for chat_id in settings.ALLOWED_USER_IDS:
-        try:
-            summary = await _build_morning_summary(calendar)
-            await notifier.send_message(chat_id, summary)
-            logger.info("Morning briefing sent to user %d", chat_id)
-        except Exception as exc:
-            logger.error("Failed to send morning briefing to %d: %s", chat_id, exc)
+    """Send the morning briefing to all users via the notifier.
+
+    Multi-user mode (user_db provided): iterates over onboarded users,
+    creates per-user calendar adapter from their stored credentials.
+
+    Legacy mode (user_db is None, calendar provided): sends a single
+    shared-calendar briefing to all ALLOWED_USER_IDS.
+    """
+    if user_db is not None:
+        from src.adapters.calendar_factory import create_calendar_adapter
+
+        users = user_db.list_users()
+        for user in users:
+            if not user.onboarded:
+                continue
+            try:
+                user_cal = create_calendar_adapter(token_json=user.calendar_token_json)
+                summary = await _build_morning_summary(
+                    user_cal, user_id=user.telegram_user_id,
+                )
+                await notifier.send_message(user.telegram_user_id, summary)
+                logger.info("Morning briefing sent to user %d", user.telegram_user_id)
+            except Exception as exc:
+                logger.error(
+                    "Failed to send morning briefing to %d: %s",
+                    user.telegram_user_id, exc,
+                )
+    else:
+        # Legacy single-calendar mode
+        for chat_id in settings.ALLOWED_USER_IDS:
+            try:
+                summary = await _build_morning_summary(calendar)
+                await notifier.send_message(chat_id, summary)
+                logger.info("Morning briefing sent to user %d", chat_id)
+            except Exception as exc:
+                logger.error("Failed to send morning briefing to %d: %s", chat_id, exc)
 
 
-async def _build_morning_summary(calendar: CalendarPort) -> str:
+async def _build_morning_summary(
+    calendar: CalendarPort,
+    user_id: int | None = None,
+) -> str:
     """Gather calendar events + chores, then ask the LLM for a friendly summary.
+
+    Args:
+        calendar: Calendar adapter (per-user or shared).
+        user_id: If provided, scope chore queries to this user.
 
     Graceful degradation:
     - Calendar API fails -> still include chores
@@ -81,7 +117,7 @@ async def _build_morning_summary(calendar: CalendarPort) -> str:
         from src.data.db import ChoreDB
 
         db = ChoreDB()
-        chores = db.get_due_chores()
+        chores = db.get_due_chores(user_id=user_id)
         if chores:
             lines = [f"  - {c.name} (assigned to {c.assigned_to})" for c in chores]
             chores_text = "Chores due today:\n" + "\n".join(lines)

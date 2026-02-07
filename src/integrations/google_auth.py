@@ -71,6 +71,51 @@ def get_calendar_service():
     return service
 
 
+def get_google_auth_url() -> tuple[str, InstalledAppFlow]:
+    """Generate a Google OAuth2 authorization URL for manual flow.
+
+    Returns (auth_url, flow) — the user visits auth_url, authorizes,
+    and pastes back the auth code.
+    """
+    from src.config import settings
+
+    creds_path = Path(settings.GOOGLE_CREDENTIALS_PATH)
+    if not creds_path.exists():
+        raise FileNotFoundError(
+            f"Google credentials file not found at {creds_path}. "
+            "Download it from the Google Cloud Console."
+        )
+
+    flow = InstalledAppFlow.from_client_secrets_file(
+        str(creds_path), SCOPES,
+        redirect_uri="urn:ietf:wg:oauth:2.0:oob",
+    )
+    auth_url, _ = flow.authorization_url(prompt="consent")
+    return auth_url, flow
+
+
+def exchange_google_auth_code(flow: InstalledAppFlow, code: str) -> str:
+    """Exchange an authorization code for credentials.
+
+    Returns the token as a JSON string suitable for storing in UserDB.
+    """
+    flow.fetch_token(code=code)
+    return flow.credentials.to_json()
+
+
+def get_calendar_service_for_user(token_json: str):
+    """Build a Google Calendar API service from stored user credentials.
+
+    Refreshes the token if expired.
+    """
+    import json
+
+    creds = Credentials.from_authorized_user_info(json.loads(token_json), SCOPES)
+    if creds.expired and creds.refresh_token:
+        creds.refresh(Request())
+    return build("calendar", "v3", credentials=creds)
+
+
 if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
     print("Running Google Calendar authorization flow...")

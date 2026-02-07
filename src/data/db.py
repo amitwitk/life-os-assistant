@@ -12,7 +12,7 @@ import sqlite3
 from datetime import date, timedelta
 from pathlib import Path
 
-from src.data.models import Chore, Contact
+from src.data.models import Chore, Contact, User
 
 logger = logging.getLogger(__name__)
 
@@ -72,6 +72,10 @@ class ChoreDB:
                 conn.execute(
                     "ALTER TABLE chores ADD COLUMN calendar_event_id TEXT"
                 )
+            if "user_id" not in existing_cols:
+                conn.execute(
+                    "ALTER TABLE chores ADD COLUMN user_id INTEGER"
+                )
         logger.debug("Chores table initialized at %s", self._db_path)
 
     @staticmethod
@@ -88,6 +92,7 @@ class ChoreDB:
             next_due=row["next_due"],
             assigned_to=row["assigned_to"],
             active=bool(row["active"]),
+            user_id=row["user_id"],
         )
 
     def add_chore(
@@ -99,6 +104,7 @@ class ChoreDB:
         preferred_time_start: str = "09:00",
         preferred_time_end: str = "21:00",
         start_date: str | None = None,
+        user_id: int | None = None,
     ) -> Chore:
         """Insert a new chore. next_due defaults to start_date (or today)."""
         if start_date is None:
@@ -110,13 +116,13 @@ class ChoreDB:
                 INSERT INTO chores
                     (name, frequency_days, duration_minutes,
                      preferred_time_start, preferred_time_end,
-                     last_done, next_due, assigned_to, active)
-                VALUES (?, ?, ?, ?, ?, NULL, ?, ?, 1)
+                     last_done, next_due, assigned_to, active, user_id)
+                VALUES (?, ?, ?, ?, ?, NULL, ?, ?, 1, ?)
                 """,
                 (
                     name, frequency_days, duration_minutes,
                     preferred_time_start, preferred_time_end,
-                    start_date, assigned_to,
+                    start_date, assigned_to, user_id,
                 ),
             )
             chore_id = cursor.lastrowid
@@ -132,6 +138,7 @@ class ChoreDB:
             next_due=start_date,
             assigned_to=assigned_to,
             active=True,
+            user_id=user_id,
         )
         logger.info("Chore added: #%d '%s' every %d days", chore_id, name, frequency_days)
         return chore
@@ -155,16 +162,22 @@ class ChoreDB:
             return None
         return self._row_to_chore(row)
 
-    def get_due_chores(self, target_date: str | None = None) -> list[Chore]:
+    def get_due_chores(
+        self, target_date: str | None = None, user_id: int | None = None,
+    ) -> list[Chore]:
         """Return all active chores where next_due <= target_date."""
         if target_date is None:
             target_date = date.today().isoformat()
 
+        query = "SELECT * FROM chores WHERE active = 1 AND next_due <= ?"
+        params: list = [target_date]
+        if user_id is not None:
+            query += " AND user_id = ?"
+            params.append(user_id)
+        query += " ORDER BY next_due"
+
         with self._connect() as conn:
-            rows = conn.execute(
-                "SELECT * FROM chores WHERE active = 1 AND next_due <= ? ORDER BY next_due",
-                (target_date,),
-            ).fetchall()
+            rows = conn.execute(query, params).fetchall()
 
         return [self._row_to_chore(r) for r in rows]
 
@@ -191,15 +204,25 @@ class ChoreDB:
         logger.info("Chore #%d '%s' marked done, next due: %s", chore_id, chore.name, next_due)
         return chore
 
-    def list_all(self, active_only: bool = True) -> list[Chore]:
-        """List all chores, optionally filtered to active only."""
-        query = "SELECT * FROM chores"
+    def list_all(
+        self, active_only: bool = True, user_id: int | None = None,
+    ) -> list[Chore]:
+        """List all chores, optionally filtered to active only and/or user."""
+        conditions: list[str] = []
+        params: list = []
         if active_only:
-            query += " WHERE active = 1"
+            conditions.append("active = 1")
+        if user_id is not None:
+            conditions.append("user_id = ?")
+            params.append(user_id)
+
+        query = "SELECT * FROM chores"
+        if conditions:
+            query += " WHERE " + " AND ".join(conditions)
         query += " ORDER BY next_due"
 
         with self._connect() as conn:
-            rows = conn.execute(query).fetchall()
+            rows = conn.execute(query, params).fetchall()
 
         return [self._row_to_chore(r) for r in rows]
 
@@ -240,9 +263,15 @@ class ContactDB:
                     id              INTEGER PRIMARY KEY AUTOINCREMENT,
                     name            TEXT NOT NULL,
                     email           TEXT NOT NULL,
-                    name_normalized TEXT NOT NULL
+                    name_normalized TEXT NOT NULL,
+                    user_id         INTEGER
                 )
             """)
+            existing_cols = {
+                row[1] for row in conn.execute("PRAGMA table_info(contacts)").fetchall()
+            }
+            if "user_id" not in existing_cols:
+                conn.execute("ALTER TABLE contacts ADD COLUMN user_id INTEGER")
         logger.debug("Contacts table initialized at %s", self._db_path)
 
     @staticmethod
@@ -252,15 +281,18 @@ class ContactDB:
             name=row["name"],
             email=row["email"],
             name_normalized=row["name_normalized"],
+            user_id=row["user_id"],
         )
 
-    def add_contact(self, name: str, email: str) -> Contact:
+    def add_contact(
+        self, name: str, email: str, user_id: int | None = None,
+    ) -> Contact:
         """Insert a new contact. Normalizes the name for case-insensitive lookup."""
         name_normalized = name.strip().lower()
         with self._connect() as conn:
             cursor = conn.execute(
-                "INSERT INTO contacts (name, email, name_normalized) VALUES (?, ?, ?)",
-                (name.strip(), email.strip(), name_normalized),
+                "INSERT INTO contacts (name, email, name_normalized, user_id) VALUES (?, ?, ?, ?)",
+                (name.strip(), email.strip(), name_normalized, user_id),
             )
             contact_id = cursor.lastrowid
 
@@ -269,25 +301,36 @@ class ContactDB:
             name=name.strip(),
             email=email.strip(),
             name_normalized=name_normalized,
+            user_id=user_id,
         )
         logger.info("Contact added: #%d '%s' <%s>", contact_id, name, email)
         return contact
 
-    def find_by_name(self, name: str) -> Contact | None:
-        """Case-insensitive exact match on name."""
+    def find_by_name(
+        self, name: str, user_id: int | None = None,
+    ) -> Contact | None:
+        """Case-insensitive exact match on name, optionally scoped to a user."""
+        query = "SELECT * FROM contacts WHERE name_normalized = ?"
+        params: list = [name.strip().lower()]
+        if user_id is not None:
+            query += " AND user_id = ?"
+            params.append(user_id)
         with self._connect() as conn:
-            row = conn.execute(
-                "SELECT * FROM contacts WHERE name_normalized = ?",
-                (name.strip().lower(),),
-            ).fetchone()
+            row = conn.execute(query, params).fetchone()
         if row is None:
             return None
         return self._row_to_contact(row)
 
-    def list_all(self) -> list[Contact]:
-        """Return all contacts."""
+    def list_all(self, user_id: int | None = None) -> list[Contact]:
+        """Return all contacts, optionally scoped to a user."""
+        query = "SELECT * FROM contacts"
+        params: list = []
+        if user_id is not None:
+            query += " WHERE user_id = ?"
+            params.append(user_id)
+        query += " ORDER BY name"
         with self._connect() as conn:
-            rows = conn.execute("SELECT * FROM contacts ORDER BY name").fetchall()
+            rows = conn.execute(query, params).fetchall()
         return [self._row_to_contact(r) for r in rows]
 
     def delete_contact(self, contact_id: int) -> bool:
@@ -300,6 +343,141 @@ class ContactDB:
         if deleted:
             logger.info("Contact #%d deleted", contact_id)
         return deleted
+
+
+class UserDB:
+    """SQLite-backed storage for registered bot users."""
+
+    def __init__(self, db_path: str | None = None) -> None:
+        if db_path is None:
+            from src.config import settings
+            db_path = settings.DATABASE_PATH
+
+        self._db_path = db_path
+        Path(db_path).parent.mkdir(parents=True, exist_ok=True)
+        self._init_db()
+
+    def _connect(self) -> sqlite3.Connection:
+        conn = sqlite3.connect(self._db_path)
+        conn.row_factory = sqlite3.Row
+        return conn
+
+    def _init_db(self) -> None:
+        with self._connect() as conn:
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS users (
+                    telegram_user_id  INTEGER PRIMARY KEY,
+                    display_name      TEXT NOT NULL,
+                    calendar_token_json TEXT,
+                    onboarded         INTEGER NOT NULL DEFAULT 0,
+                    invited_by        INTEGER,
+                    is_admin          INTEGER NOT NULL DEFAULT 0,
+                    created_at        TEXT NOT NULL
+                )
+            """)
+        logger.debug("Users table initialized at %s", self._db_path)
+
+    @staticmethod
+    def _row_to_user(row: sqlite3.Row) -> User:
+        return User(
+            telegram_user_id=row["telegram_user_id"],
+            display_name=row["display_name"],
+            calendar_token_json=row["calendar_token_json"],
+            onboarded=bool(row["onboarded"]),
+            invited_by=row["invited_by"],
+            is_admin=bool(row["is_admin"]),
+            created_at=row["created_at"],
+        )
+
+    def add_user(
+        self,
+        telegram_user_id: int,
+        display_name: str,
+        invited_by: int | None = None,
+        is_admin: bool = False,
+    ) -> User:
+        """Register a new user."""
+        from datetime import datetime
+
+        now = datetime.now().isoformat()
+        with self._connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO users
+                    (telegram_user_id, display_name, onboarded, invited_by, is_admin, created_at)
+                VALUES (?, ?, 0, ?, ?, ?)
+                """,
+                (telegram_user_id, display_name, invited_by, int(is_admin), now),
+            )
+        user = User(
+            telegram_user_id=telegram_user_id,
+            display_name=display_name,
+            onboarded=False,
+            invited_by=invited_by,
+            is_admin=is_admin,
+            created_at=now,
+        )
+        logger.info("User registered: %d '%s'", telegram_user_id, display_name)
+        return user
+
+    def get_user(self, telegram_user_id: int) -> User | None:
+        """Fetch a user by Telegram user ID."""
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM users WHERE telegram_user_id = ?",
+                (telegram_user_id,),
+            ).fetchone()
+        if row is None:
+            return None
+        return self._row_to_user(row)
+
+    def set_calendar_token(self, telegram_user_id: int, token_json: str) -> None:
+        """Store calendar credentials for a user."""
+        with self._connect() as conn:
+            conn.execute(
+                "UPDATE users SET calendar_token_json = ? WHERE telegram_user_id = ?",
+                (token_json, telegram_user_id),
+            )
+        logger.info("Calendar token set for user %d", telegram_user_id)
+
+    def mark_onboarded(self, telegram_user_id: int) -> None:
+        """Mark a user as fully onboarded."""
+        with self._connect() as conn:
+            conn.execute(
+                "UPDATE users SET onboarded = 1 WHERE telegram_user_id = ?",
+                (telegram_user_id,),
+            )
+        logger.info("User %d marked as onboarded", telegram_user_id)
+
+    def list_users(self) -> list[User]:
+        """Return all registered users."""
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT * FROM users ORDER BY created_at"
+            ).fetchall()
+        return [self._row_to_user(r) for r in rows]
+
+    def is_registered(self, telegram_user_id: int) -> bool:
+        """Check if a user is registered."""
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT 1 FROM users WHERE telegram_user_id = ?",
+                (telegram_user_id,),
+            ).fetchone()
+        return row is not None
+
+    def backfill_user_id(self, user_id: int) -> None:
+        """Assign orphan chores and contacts (user_id IS NULL) to a user."""
+        with self._connect() as conn:
+            conn.execute(
+                "UPDATE chores SET user_id = ? WHERE user_id IS NULL",
+                (user_id,),
+            )
+            conn.execute(
+                "UPDATE contacts SET user_id = ? WHERE user_id IS NULL",
+                (user_id,),
+            )
+        logger.info("Backfilled orphan chores/contacts to user %d", user_id)
 
 
 if __name__ == "__main__":

@@ -11,7 +11,6 @@ from datetime import date, datetime, timedelta
 
 from src.config import settings
 from src.core.parser import ParsedEvent
-from src.integrations.google_auth import get_calendar_service
 from src.ports.calendar_port import CalendarError
 
 logger = logging.getLogger(__name__)
@@ -46,10 +45,21 @@ def _build_event_body(parsed_event: ParsedEvent) -> dict:
 class GoogleCalendarAdapter:
     """Google Calendar implementation of CalendarPort."""
 
+    def __init__(self, token_json: str | None = None) -> None:
+        self._token_json = token_json
+
+    def _get_service(self):
+        """Get a Google Calendar API service using per-user or global credentials."""
+        if self._token_json:
+            from src.integrations.google_auth import get_calendar_service_for_user
+            return get_calendar_service_for_user(self._token_json)
+        from src.integrations.google_auth import get_calendar_service
+        return get_calendar_service()
+
     async def add_event(self, parsed_event: ParsedEvent) -> dict:
         event_body = _build_event_body(parsed_event)
         try:
-            service = get_calendar_service()
+            service = self._get_service()
             created = (
                 service.events()
                 .insert(calendarId="primary", body=event_body)
@@ -76,7 +86,7 @@ class GoogleCalendarAdapter:
         time_max = f"{target_date}T23:59:59+03:00"
 
         try:
-            service = get_calendar_service()
+            service = self._get_service()
             result = (
                 service.events()
                 .list(
@@ -128,7 +138,7 @@ class GoogleCalendarAdapter:
 
     async def delete_event(self, event_id: str) -> None:
         try:
-            service = get_calendar_service()
+            service = self._get_service()
             service.events().delete(
                 calendarId="primary", eventId=event_id
             ).execute()
@@ -141,7 +151,7 @@ class GoogleCalendarAdapter:
         self, event_id: str, new_date: str, new_time: str
     ) -> dict:
         try:
-            service = get_calendar_service()
+            service = self._get_service()
             event = (
                 service.events()
                 .get(calendarId="primary", eventId=event_id)
@@ -194,7 +204,7 @@ class GoogleCalendarAdapter:
 
     async def add_guests(self, event_id: str, guests: list[str]) -> dict:
         try:
-            service = get_calendar_service()
+            service = self._get_service()
             event = (
                 service.events()
                 .get(calendarId="primary", eventId=event_id)
@@ -219,7 +229,7 @@ class GoogleCalendarAdapter:
 
     async def update_event_fields(self, event_id: str, **fields: object) -> dict:
         try:
-            service = get_calendar_service()
+            service = self._get_service()
             event = (
                 service.events()
                 .get(calendarId="primary", eventId=event_id)
@@ -309,7 +319,7 @@ class GoogleCalendarAdapter:
         }
 
         try:
-            service = get_calendar_service()
+            service = self._get_service()
             created = (
                 service.events()
                 .insert(calendarId="primary", body=body)

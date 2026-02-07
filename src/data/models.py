@@ -12,6 +12,19 @@ from dataclasses import dataclass, field
 
 
 @dataclass
+class User:
+    """A registered bot user with their own calendar and data."""
+
+    telegram_user_id: int
+    display_name: str
+    calendar_token_json: str | None = None
+    onboarded: bool = False
+    invited_by: int | None = None
+    is_admin: bool = False
+    created_at: str = ""
+
+
+@dataclass
 class Contact:
     """A named contact for smart guest resolution.
 
@@ -23,6 +36,7 @@ class Contact:
     name: str              # original name, e.g. "Yahav"
     email: str             # e.g. "yahav@gmail.com"
     name_normalized: str   # lowercased for case-insensitive lookup
+    user_id: int | None = None
 
 
 @dataclass
@@ -44,3 +58,4 @@ class Chore:
     last_done: str | None = None      # ISO date YYYY-MM-DD, None if never done
     calendar_event_id: str | None = None  # Google Calendar recurring event ID
     active: bool = field(default=True)
+    user_id: int | None = None

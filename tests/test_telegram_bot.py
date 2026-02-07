@@ -10,12 +10,14 @@ from unittest.mock import AsyncMock, MagicMock, patch
 from src.bot.telegram_bot import (
     _parse_time_pref,
     _clear_chore_data,
+    _get_service,
     CHORE_NAME,
     CHORE_FREQ,
     CHORE_DURATION,
     CHORE_TIME_PREF,
     CHORE_WEEKS,
     CHORE_CONFIRM,
+    SETUP_WAITING_AUTH_CODE,
 )
 from src.core.action_service import (
     ActionService,
@@ -329,6 +331,7 @@ class TestAuthorization:
         update.effective_user.id = 99999  # not in ALLOWED_USER_IDS
         update.message.reply_text = AsyncMock()
         context = MagicMock()
+        context.bot_data = {}  # No user_db → legacy mode
 
         await cmd_start(update, context)
         update.message.reply_text.assert_not_called()
@@ -341,6 +344,7 @@ class TestAuthorization:
         update.effective_user.id = 12345  # matches ALLOWED_USER_IDS in conftest
         update.message.reply_text = AsyncMock()
         context = MagicMock()
+        context.bot_data = {}  # No user_db → legacy mode
 
         await cmd_start(update, context)
         update.message.reply_text.assert_called_once()
@@ -1329,3 +1333,284 @@ class TestContactEmailResolution:
         update.message.reply_text.assert_called_with(
             "No pending contact resolution. Please start over."
         )
+
+
+# ---------------------------------------------------------------------------
+# Tests for new auth decorators (multi-user)
+# ---------------------------------------------------------------------------
+
+
+def _make_user_db_context(service=None, user_db=None):
+    """Create a mock context with user_db in bot_data (multi-user mode)."""
+    context = MagicMock()
+    context.user_data = {}
+    mock_service = service or _make_service()
+    mock_user_db = user_db or MagicMock()
+    context.bot_data = {
+        "user_db": mock_user_db,
+    }
+    return context
+
+
+class TestRegisteredOnlyDecorator:
+    @pytest.mark.asyncio
+    async def test_registered_onboarded_user_allowed(self):
+        from src.bot.telegram_bot import registered_only
+        from src.data.models import User
+
+        @registered_only
+        async def dummy_handler(update, context):
+            return "ok"
+
+        mock_user_db = MagicMock()
+        mock_user_db.get_user.return_value = User(
+            telegram_user_id=12345, display_name="Amit",
+            onboarded=True, is_admin=True,
+        )
+        update = _make_update("test")
+        context = _make_user_db_context(user_db=mock_user_db)
+
+        result = await dummy_handler(update, context)
+        assert result == "ok"
+
+    @pytest.mark.asyncio
+    async def test_registered_not_onboarded_user_told_to_setup(self):
+        from src.bot.telegram_bot import registered_only
+        from src.data.models import User
+
+        @registered_only
+        async def dummy_handler(update, context):
+            return "ok"
+
+        mock_user_db = MagicMock()
+        mock_user_db.get_user.return_value = User(
+            telegram_user_id=12345, display_name="Amit",
+            onboarded=False, is_admin=False,
+        )
+        update = _make_update("test")
+        context = _make_user_db_context(user_db=mock_user_db)
+
+        result = await dummy_handler(update, context)
+        assert result is None
+        update.message.reply_text.assert_called_once()
+        assert "setup" in update.message.reply_text.call_args[0][0].lower()
+
+    @pytest.mark.asyncio
+    async def test_unregistered_user_ignored(self):
+        from src.bot.telegram_bot import registered_only
+
+        @registered_only
+        async def dummy_handler(update, context):
+            return "ok"
+
+        mock_user_db = MagicMock()
+        mock_user_db.get_user.return_value = None
+        update = _make_update("test", user_id=99999)
+        context = _make_user_db_context(user_db=mock_user_db)
+
+        result = await dummy_handler(update, context)
+        assert result is None
+
+
+class TestAdminOnlyDecorator:
+    @pytest.mark.asyncio
+    async def test_admin_allowed(self):
+        from src.bot.telegram_bot import admin_only
+        from src.data.models import User
+
+        @admin_only
+        async def dummy_handler(update, context):
+            return "ok"
+
+        mock_user_db = MagicMock()
+        mock_user_db.get_user.return_value = User(
+            telegram_user_id=12345, display_name="Amit",
+            onboarded=True, is_admin=True,
+        )
+        update = _make_update("test")
+        context = _make_user_db_context(user_db=mock_user_db)
+
+        result = await dummy_handler(update, context)
+        assert result == "ok"
+
+    @pytest.mark.asyncio
+    async def test_non_admin_rejected(self):
+        from src.bot.telegram_bot import admin_only
+        from src.data.models import User
+
+        @admin_only
+        async def dummy_handler(update, context):
+            return "ok"
+
+        mock_user_db = MagicMock()
+        mock_user_db.get_user.return_value = User(
+            telegram_user_id=67890, display_name="Dana",
+            onboarded=True, is_admin=False,
+        )
+        update = _make_update("test", user_id=67890)
+        context = _make_user_db_context(user_db=mock_user_db)
+
+        result = await dummy_handler(update, context)
+        assert result is None
+
+
+class TestGetServiceHelper:
+    def test_legacy_mode_returns_shared_service(self):
+        """When no user_db in bot_data, returns shared action_service."""
+        mock_service = _make_service()
+        context = MagicMock()
+        context.user_data = {}
+        context.bot_data = {"action_service": mock_service}
+
+        result = _get_service(12345, context)
+        assert result is mock_service
+
+    def test_multi_user_mode_creates_per_user_service(self):
+        """When user_db is present, creates a per-user ActionService."""
+        from src.data.models import User
+
+        mock_user_db = MagicMock()
+        mock_user_db.get_user.return_value = User(
+            telegram_user_id=12345, display_name="Amit",
+            calendar_token_json='{"token": "abc"}',
+            onboarded=True, is_admin=True,
+        )
+
+        context = MagicMock()
+        context.user_data = {}
+        context.bot_data = {"user_db": mock_user_db}
+
+        with patch("src.adapters.calendar_factory.create_calendar_adapter") as mock_factory, \
+             patch("src.data.db.ContactDB"):
+            mock_factory.return_value = MagicMock()
+            result = _get_service(12345, context)
+
+        assert isinstance(result, ActionService)
+        mock_factory.assert_called_once_with(token_json='{"token": "abc"}')
+        # Should be cached
+        assert context.user_data["action_service"] is result
+
+    def test_cached_service_returned(self):
+        """Subsequent calls return cached service from user_data."""
+        mock_service = MagicMock(spec=ActionService)
+        mock_user_db = MagicMock()
+
+        context = MagicMock()
+        context.user_data = {"action_service": mock_service}
+        context.bot_data = {"user_db": mock_user_db}
+
+        result = _get_service(12345, context)
+        assert result is mock_service
+        # Should NOT call get_user since cache was hit
+        mock_user_db.get_user.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# Tests for /invite command
+# ---------------------------------------------------------------------------
+
+
+class TestInviteCommand:
+    @pytest.mark.asyncio
+    async def test_invite_new_user(self):
+        from src.bot.telegram_bot import cmd_invite
+        from src.data.models import User
+
+        mock_user_db = MagicMock()
+        mock_user_db.get_user.return_value = User(
+            telegram_user_id=12345, display_name="Amit",
+            onboarded=True, is_admin=True,
+        )
+        mock_user_db.is_registered.return_value = False
+
+        update = _make_update("/invite 67890 Dana")
+        context = _make_user_db_context(user_db=mock_user_db)
+        context.args = ["67890", "Dana"]
+
+        await cmd_invite(update, context)
+
+        mock_user_db.add_user.assert_called_once_with(
+            telegram_user_id=67890,
+            display_name="Dana",
+            invited_by=12345,
+            is_admin=False,
+        )
+        call_text = update.message.reply_text.call_args[0][0]
+        assert "Dana" in call_text
+        assert "67890" in call_text
+
+    @pytest.mark.asyncio
+    async def test_invite_already_registered(self):
+        from src.bot.telegram_bot import cmd_invite
+        from src.data.models import User
+
+        mock_user_db = MagicMock()
+        mock_user_db.get_user.return_value = User(
+            telegram_user_id=12345, display_name="Amit",
+            onboarded=True, is_admin=True,
+        )
+        mock_user_db.is_registered.return_value = True
+
+        update = _make_update("/invite 67890")
+        context = _make_user_db_context(user_db=mock_user_db)
+        context.args = ["67890"]
+
+        await cmd_invite(update, context)
+
+        mock_user_db.add_user.assert_not_called()
+        assert "already registered" in update.message.reply_text.call_args[0][0]
+
+    @pytest.mark.asyncio
+    async def test_invite_no_args(self):
+        from src.bot.telegram_bot import cmd_invite
+        from src.data.models import User
+
+        mock_user_db = MagicMock()
+        mock_user_db.get_user.return_value = User(
+            telegram_user_id=12345, display_name="Amit",
+            onboarded=True, is_admin=True,
+        )
+
+        update = _make_update("/invite")
+        context = _make_user_db_context(user_db=mock_user_db)
+        context.args = []
+
+        await cmd_invite(update, context)
+
+        assert "Usage" in update.message.reply_text.call_args[0][0]
+
+
+# ---------------------------------------------------------------------------
+# Tests for /users command
+# ---------------------------------------------------------------------------
+
+
+class TestUsersCommand:
+    @pytest.mark.asyncio
+    async def test_lists_registered_users(self):
+        from src.bot.telegram_bot import cmd_users
+        from src.data.models import User
+
+        mock_user_db = MagicMock()
+        # admin_only check
+        mock_user_db.get_user.return_value = User(
+            telegram_user_id=12345, display_name="Amit",
+            onboarded=True, is_admin=True,
+        )
+        mock_user_db.list_users.return_value = [
+            User(telegram_user_id=12345, display_name="Amit",
+                 onboarded=True, is_admin=True),
+            User(telegram_user_id=67890, display_name="Dana",
+                 onboarded=False, is_admin=False),
+        ]
+
+        update = _make_update("/users")
+        context = _make_user_db_context(user_db=mock_user_db)
+
+        await cmd_users(update, context)
+
+        call_text = update.message.reply_text.call_args[0][0]
+        assert "Amit" in call_text
+        assert "Dana" in call_text
+        assert "admin" in call_text
+        assert "pending setup" in call_text

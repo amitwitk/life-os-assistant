@@ -147,6 +147,35 @@ def _parse_vevent(event_data: caldav.Event) -> dict:
 class CalDAVCalendarAdapter:
     """CalDAV implementation of CalendarPort."""
 
+    def __init__(self, cred_json: str | None = None) -> None:
+        self._cred_json = cred_json
+
+    def _get_calendar(self) -> caldav.Calendar:
+        """Get a CalDAV calendar using per-user or global credentials."""
+        if self._cred_json:
+            import json
+            creds = json.loads(self._cred_json)
+            client = caldav.DAVClient(
+                url=creds["url"],
+                username=creds["username"],
+                password=creds["password"],
+            )
+            principal = client.principal()
+            calendars = principal.calendars()
+            if not calendars:
+                raise CalendarError("No calendars found on the CalDAV server.")
+            cal_name = creds.get("calendar_name", "")
+            if cal_name:
+                for cal in calendars:
+                    if cal.name == cal_name:
+                        return cal
+                raise CalendarError(
+                    f"Calendar '{cal_name}' not found. "
+                    f"Available: {[c.name for c in calendars]}"
+                )
+            return calendars[0]
+        return _get_calendar()
+
     async def add_event(self, parsed_event: ParsedEvent) -> dict:
         start_dt = datetime.strptime(
             f"{parsed_event.date} {parsed_event.time}", "%Y-%m-%d %H:%M"
@@ -165,7 +194,7 @@ class CalDAVCalendarAdapter:
         )
 
         try:
-            cal = await asyncio.to_thread(_get_calendar)
+            cal = await asyncio.to_thread(self._get_calendar)
             await asyncio.to_thread(cal.save_event, vcal)
             logger.info(
                 "CalDAV event created: '%s' on %s",
@@ -196,7 +225,7 @@ class CalDAVCalendarAdapter:
         end = datetime.fromisoformat(f"{target_date}T23:59:59")
 
         try:
-            cal = await asyncio.to_thread(_get_calendar)
+            cal = await asyncio.to_thread(self._get_calendar)
             results = await asyncio.to_thread(
                 cal.search, start=start, end=end, event=True, expand=True
             )
@@ -228,7 +257,7 @@ class CalDAVCalendarAdapter:
 
     async def delete_event(self, event_id: str) -> None:
         try:
-            cal = await asyncio.to_thread(_get_calendar)
+            cal = await asyncio.to_thread(self._get_calendar)
 
             # Search broadly and find the event by UID
             results = await asyncio.to_thread(
@@ -252,7 +281,7 @@ class CalDAVCalendarAdapter:
         self, event_id: str, new_date: str, new_time: str
     ) -> dict:
         try:
-            cal = await asyncio.to_thread(_get_calendar)
+            cal = await asyncio.to_thread(self._get_calendar)
 
             results = await asyncio.to_thread(
                 cal.search, start=datetime(2000, 1, 1), end=datetime(2099, 12, 31), event=True
@@ -306,7 +335,7 @@ class CalDAVCalendarAdapter:
 
     async def add_guests(self, event_id: str, guests: list[str]) -> dict:
         try:
-            cal = await asyncio.to_thread(_get_calendar)
+            cal = await asyncio.to_thread(self._get_calendar)
             results = await asyncio.to_thread(
                 cal.search, start=datetime(2000, 1, 1), end=datetime(2099, 12, 31), event=True
             )
@@ -346,7 +375,7 @@ class CalDAVCalendarAdapter:
 
     async def update_event_fields(self, event_id: str, **fields: object) -> dict:
         try:
-            cal = await asyncio.to_thread(_get_calendar)
+            cal = await asyncio.to_thread(self._get_calendar)
             results = await asyncio.to_thread(
                 cal.search, start=datetime(2000, 1, 1), end=datetime(2099, 12, 31), event=True
             )
@@ -443,7 +472,7 @@ class CalDAVCalendarAdapter:
         )
 
         try:
-            cal = await asyncio.to_thread(_get_calendar)
+            cal = await asyncio.to_thread(self._get_calendar)
             await asyncio.to_thread(cal.save_event, vcal)
             logger.info(
                 "CalDAV recurring event created: '%s' starting %s %s–%s, "
