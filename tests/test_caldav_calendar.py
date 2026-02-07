@@ -480,3 +480,53 @@ class TestCalDAVGetDailyEvents:
             events = await adapter.get_daily_events(target_date="2026-02-14")
 
         assert len(events) == 1
+
+
+class TestCalDAVUpdateEventFields:
+    @pytest.mark.asyncio
+    async def test_update_location(self):
+        ev = _make_caldav_event(uid="upd-uid")
+        mock_cal = MagicMock()
+        mock_cal.search = MagicMock(return_value=[ev])
+
+        with patch(_PATCH_GET_CAL, return_value=mock_cal):
+            adapter = CalDAVCalendarAdapter()
+            result = await adapter.update_event_fields("upd-uid", location="Blue Bottle")
+
+        assert result["id"] == "upd-uid"
+        ev.save.assert_called_once()
+        # The saved data should contain the location
+        assert "Blue Bottle" in ev.data
+
+    @pytest.mark.asyncio
+    async def test_update_description(self):
+        ev = _make_caldav_event(uid="upd-uid")
+        mock_cal = MagicMock()
+        mock_cal.search = MagicMock(return_value=[ev])
+
+        with patch(_PATCH_GET_CAL, return_value=mock_cal):
+            adapter = CalDAVCalendarAdapter()
+            result = await adapter.update_event_fields("upd-uid", description="New notes")
+
+        ev.save.assert_called_once()
+        assert "New notes" in ev.data
+
+    @pytest.mark.asyncio
+    async def test_update_not_found(self):
+        mock_cal = MagicMock()
+        mock_cal.search = MagicMock(return_value=[])
+
+        with patch(_PATCH_GET_CAL, return_value=mock_cal):
+            adapter = CalDAVCalendarAdapter()
+            with pytest.raises(CalendarError, match="not found"):
+                await adapter.update_event_fields("nonexistent", location="Anywhere")
+
+    @pytest.mark.asyncio
+    async def test_update_failure(self):
+        mock_cal = MagicMock()
+        mock_cal.search = MagicMock(side_effect=Exception("fail"))
+
+        with patch(_PATCH_GET_CAL, return_value=mock_cal):
+            adapter = CalDAVCalendarAdapter()
+            with pytest.raises(CalendarError):
+                await adapter.update_event_fields("uid", location="Fail")

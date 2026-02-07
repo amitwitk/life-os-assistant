@@ -344,6 +344,69 @@ class CalDAVCalendarAdapter:
             logger.error("CalDAV error (add_guests): %s", exc)
             raise CalendarError(f"Failed to add guests: {exc}") from exc
 
+    async def update_event_fields(self, event_id: str, **fields: object) -> dict:
+        try:
+            cal = await asyncio.to_thread(_get_calendar)
+            results = await asyncio.to_thread(
+                cal.search, start=datetime(2000, 1, 1), end=datetime(2099, 12, 31), event=True
+            )
+
+            for ev in results:
+                parsed = _parse_vevent(ev)
+                if parsed["id"] != event_id:
+                    continue
+
+                ical = iCalendar.from_ical(ev.data)
+                for component in ical.walk():
+                    if component.name != "VEVENT":
+                        continue
+
+                    if "location" in fields:
+                        component["location"] = fields["location"]
+                    if "description" in fields:
+                        component["description"] = fields["description"]
+                    if "time" in fields:
+                        dtstart = component.get("dtstart")
+                        dtend = component.get("dtend")
+                        if dtstart and dtend:
+                            duration = dtend.dt - dtstart.dt
+                        else:
+                            duration = timedelta(hours=1)
+                        orig_date = dtstart.dt.strftime("%Y-%m-%d") if dtstart else date.today().isoformat()
+                        new_start = datetime.strptime(f"{orig_date} {fields['time']}", "%Y-%m-%d %H:%M")
+                        new_end = new_start + duration
+                        component["dtstart"].dt = new_start
+                        component["dtend"].dt = new_end
+                    if "add_guests" in fields:
+                        existing_emails = set()
+                        for att in component.get("attendee", []):
+                            existing_emails.add(str(att).replace("mailto:", ""))
+                        for email in fields["add_guests"]:
+                            if email not in existing_emails:
+                                attendee = vCalAddress(f"mailto:{email}")
+                                attendee.params["ROLE"] = "REQ-PARTICIPANT"
+                                component.add("attendee", attendee)
+                    if "remove_guests" in fields:
+                        remove_set = set(fields["remove_guests"])
+                        existing_attendees = component.get("attendee", [])
+                        if isinstance(existing_attendees, list):
+                            component.contents["attendee"] = [
+                                a for a in existing_attendees
+                                if str(a).replace("mailto:", "") not in remove_set
+                            ]
+
+                    ev.data = ical.to_ical().decode("utf-8")
+                    await asyncio.to_thread(ev.save)
+                    logger.info("Updated fields %s on CalDAV event %s", list(fields.keys()), event_id)
+                    return _parse_vevent(ev)
+
+            raise CalendarError(f"Event with UID {event_id} not found.")
+        except CalendarError:
+            raise
+        except Exception as exc:
+            logger.error("CalDAV error (update_event_fields): %s", exc)
+            raise CalendarError(f"Failed to update event fields: {exc}") from exc
+
     async def add_recurring_event(
         self,
         summary: str,

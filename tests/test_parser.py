@@ -10,6 +10,7 @@ from src.core.parser import (
     RescheduleEvent,
     QueryEvents,
     AddGuests,
+    ModifyEvent,
     parse_message,
     match_event,
     batch_match_events,
@@ -427,7 +428,7 @@ class TestIntentRegistry:
 
         # Get all types from the ParserResponse union
         response_types = set(typing.get_args(
-            ParsedEvent | CancelEvent | RescheduleEvent | QueryEvents | CancelAllExcept | AddGuests
+            ParsedEvent | CancelEvent | RescheduleEvent | QueryEvents | CancelAllExcept | AddGuests | ModifyEvent
         ))
         registry_types = set(INTENT_REGISTRY.values())
         assert response_types == registry_types
@@ -562,3 +563,87 @@ class TestLocationField:
         from src.core.parser import _is_prompt_hidden
         field_info = ParsedEvent.model_fields["location"]
         assert not _is_prompt_hidden(field_info)
+
+
+# ---------------------------------------------------------------------------
+# Tests for ModifyEvent model
+# ---------------------------------------------------------------------------
+
+
+class TestModifyEvent:
+    def test_create_with_defaults(self):
+        m = ModifyEvent()
+        assert m.intent == "modify"
+        assert m.add_location == ""
+        assert m.add_guests == []
+        assert m.remove_guests == []
+        assert m.mentioned_contacts == []
+        assert m.new_time == ""
+        assert m.new_description == ""
+        assert m.event_id == ""
+
+    def test_log_summary_location(self):
+        m = ModifyEvent(add_location="Blue Bottle Coffee")
+        assert "location=Blue Bottle Coffee" in m.log_summary
+
+    def test_log_summary_guests(self):
+        m = ModifyEvent(add_guests=["dan@email.com"])
+        assert "guests+=" in m.log_summary
+
+    def test_log_summary_remove_guests(self):
+        m = ModifyEvent(remove_guests=["dan@email.com"])
+        assert "guests-=" in m.log_summary
+
+    def test_log_summary_time(self):
+        m = ModifyEvent(new_time="15:00")
+        assert "time=15:00" in m.log_summary
+
+    def test_log_summary_description(self):
+        m = ModifyEvent(new_description="Updated notes")
+        assert "description updated" in m.log_summary
+
+    def test_log_summary_no_changes(self):
+        m = ModifyEvent()
+        assert "no changes" in m.log_summary
+
+    def test_prompt_hidden_fields(self):
+        """Bot-injected fields should be hidden from the LLM prompt."""
+        from src.core.parser import _is_prompt_hidden
+        for field_name in ("event_id", "event_summary", "event_date", "event_time"):
+            assert _is_prompt_hidden(ModifyEvent.model_fields[field_name]), (
+                f"{field_name} should be prompt_hidden"
+            )
+
+    def test_visible_fields_not_hidden(self):
+        from src.core.parser import _is_prompt_hidden
+        for field_name in ("add_location", "add_guests", "remove_guests", "new_time"):
+            assert not _is_prompt_hidden(ModifyEvent.model_fields[field_name]), (
+                f"{field_name} should NOT be prompt_hidden"
+            )
+
+    @pytest.mark.asyncio
+    async def test_parse_modify_intent(self):
+        llm_response = '[{"intent": "modify", "add_location": "Blue Bottle Coffee"}]'
+        with patch("src.core.parser.complete", AsyncMock(return_value=llm_response)):
+            result = await parse_message("add location: Blue Bottle Coffee")
+        assert len(result) == 1
+        assert isinstance(result[0], ModifyEvent)
+        assert result[0].add_location == "Blue Bottle Coffee"
+
+    @pytest.mark.asyncio
+    async def test_parse_modify_with_guests(self):
+        llm_response = '[{"intent": "modify", "mentioned_contacts": ["Shon"]}]'
+        with patch("src.core.parser.complete", AsyncMock(return_value=llm_response)):
+            result = await parse_message("also invite Shon")
+        assert len(result) == 1
+        assert isinstance(result[0], ModifyEvent)
+        assert result[0].mentioned_contacts == ["Shon"]
+
+    def test_registry_includes_modify(self):
+        from src.core.parser import INTENT_REGISTRY
+        assert "modify" in INTENT_REGISTRY
+        assert INTENT_REGISTRY["modify"] is ModifyEvent
+
+    def test_prompt_includes_modify_section(self):
+        from src.core.parser import _SYSTEM_PROMPT
+        assert "Modify Last Event" in _SYSTEM_PROMPT

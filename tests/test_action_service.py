@@ -1684,3 +1684,357 @@ class TestLocationEnrichment:
 
         assert isinstance(response, SuccessResponse)
         assert "Some Place" in response.message
+
+
+# ---------------------------------------------------------------------------
+# Modify last event
+# ---------------------------------------------------------------------------
+
+
+class TestModifyEvent:
+    @pytest.mark.asyncio
+    async def test_modify_location_success(self):
+        """Modify location on last event → SuccessResponse with updated info."""
+        from src.core.parser import ModifyEvent
+
+        service, cal = _make_service()
+        cal.update_event_fields = AsyncMock(return_value={
+            "id": "ev1", "htmlLink": "https://cal/1",
+        })
+
+        parsed = ModifyEvent(
+            add_location="Blue Bottle Coffee",
+            event_id="ev1", event_summary="Meeting with Dan",
+            event_date="2026-02-08", event_time="14:00",
+        )
+
+        with patch("src.core.parser.parse_message", AsyncMock(return_value=[parsed])):
+            response = await service.process_text(
+                "add location: Blue Bottle Coffee",
+                last_event_context={
+                    "event_id": "ev1", "event_summary": "Meeting with Dan",
+                    "event_date": "2026-02-08", "event_time": "14:00",
+                },
+            )
+
+        assert isinstance(response, SuccessResponse)
+        assert "Meeting with Dan" in response.message
+        assert "location" in response.message
+        assert response.event is not None
+        assert response.event.event_id == "ev1"
+        cal.update_event_fields.assert_called_once()
+        call_kwargs = cal.update_event_fields.call_args
+        assert call_kwargs[0][0] == "ev1"
+        assert "location" in call_kwargs[1]
+
+    @pytest.mark.asyncio
+    async def test_modify_add_guests_success(self):
+        """Modify adds guests via update_event_fields."""
+        from src.core.parser import ModifyEvent
+
+        service, cal = _make_service()
+        cal.update_event_fields = AsyncMock(return_value={"id": "ev1", "htmlLink": ""})
+
+        parsed = ModifyEvent(
+            add_guests=["shon@email.com"],
+            event_id="ev1", event_summary="Meeting with Dan",
+            event_date="2026-02-08", event_time="14:00",
+        )
+
+        with patch("src.core.parser.parse_message", AsyncMock(return_value=[parsed])):
+            response = await service.process_text(
+                "also invite shon@email.com",
+                last_event_context={
+                    "event_id": "ev1", "event_summary": "Meeting with Dan",
+                    "event_date": "2026-02-08", "event_time": "14:00",
+                },
+            )
+
+        assert isinstance(response, SuccessResponse)
+        assert "shon@email.com" in response.message
+        cal.update_event_fields.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_modify_no_event_id_returns_error(self):
+        """Modify without event context → error."""
+        from src.core.parser import ModifyEvent
+
+        service, cal = _make_service()
+
+        parsed = ModifyEvent(add_location="Some Place")
+
+        with patch("src.core.parser.parse_message", AsyncMock(return_value=[parsed])):
+            response = await service.process_text("add location: Some Place")
+
+        assert isinstance(response, ErrorResponse)
+        assert "No recent event" in response.message
+
+    @pytest.mark.asyncio
+    async def test_modify_no_changes_returns_error(self):
+        """Modify with no fields populated → error."""
+        from src.core.parser import ModifyEvent
+
+        service, cal = _make_service()
+
+        parsed = ModifyEvent(
+            event_id="ev1", event_summary="Meeting",
+            event_date="2026-02-08", event_time="14:00",
+        )
+
+        with patch("src.core.parser.parse_message", AsyncMock(return_value=[parsed])):
+            response = await service.process_text(
+                "modify something",
+                last_event_context={
+                    "event_id": "ev1", "event_summary": "Meeting",
+                    "event_date": "2026-02-08", "event_time": "14:00",
+                },
+            )
+
+        assert isinstance(response, ErrorResponse)
+        assert "couldn't determine" in response.message.lower()
+
+    @pytest.mark.asyncio
+    async def test_modify_time_success(self):
+        """Modify time → SuccessResponse with time change."""
+        from src.core.parser import ModifyEvent
+
+        service, cal = _make_service()
+        cal.update_event_fields = AsyncMock(return_value={"id": "ev1", "htmlLink": ""})
+
+        parsed = ModifyEvent(
+            new_time="16:00",
+            event_id="ev1", event_summary="Meeting",
+            event_date="2026-02-08", event_time="14:00",
+        )
+
+        with patch("src.core.parser.parse_message", AsyncMock(return_value=[parsed])):
+            response = await service.process_text(
+                "change time to 16:00",
+                last_event_context={
+                    "event_id": "ev1", "event_summary": "Meeting",
+                    "event_date": "2026-02-08", "event_time": "14:00",
+                },
+            )
+
+        assert isinstance(response, SuccessResponse)
+        assert "16:00" in response.message
+        call_kwargs = cal.update_event_fields.call_args[1]
+        assert call_kwargs["time"] == "16:00"
+
+    @pytest.mark.asyncio
+    async def test_modify_with_contact_resolution(self, contact_db):
+        """Modify with mentioned_contacts triggers contact prompt."""
+        from src.core.parser import ModifyEvent
+
+        service, cal = _make_service_with_contacts(contact_db=contact_db)
+
+        parsed = ModifyEvent(
+            mentioned_contacts=["Shon"],
+            event_id="ev1", event_summary="Meeting",
+            event_date="2026-02-08", event_time="14:00",
+        )
+
+        with patch("src.core.parser.parse_message", AsyncMock(return_value=[parsed])):
+            response = await service.process_text(
+                "also invite Shon",
+                last_event_context={
+                    "event_id": "ev1", "event_summary": "Meeting",
+                    "event_date": "2026-02-08", "event_time": "14:00",
+                },
+            )
+
+        assert isinstance(response, ContactPromptResponse)
+        assert response.contact_name == "Shon"
+        assert response.pending.action_type == "modify"
+
+    @pytest.mark.asyncio
+    async def test_modify_location_with_maps_enrichment(self):
+        """Modify location gets enriched via Google Maps."""
+        from src.core.parser import ModifyEvent
+        from src.integrations.google_maps import EnrichedLocation
+
+        service, cal = _make_service()
+        cal.update_event_fields = AsyncMock(return_value={"id": "ev1", "htmlLink": ""})
+
+        parsed = ModifyEvent(
+            add_location="Blue Bottle Coffee",
+            event_id="ev1", event_summary="Coffee",
+            event_date="2026-02-08", event_time="10:00",
+        )
+
+        enriched = EnrichedLocation(
+            display_name="Blue Bottle Coffee",
+            formatted_address="1 Ferry Building, SF",
+            maps_url="https://maps.google.com/?q=blue+bottle",
+        )
+
+        with patch("src.core.parser.parse_message", AsyncMock(return_value=[parsed])), \
+             patch("src.config.settings") as mock_settings, \
+             patch("src.integrations.google_maps.enrich_location", AsyncMock(return_value=enriched)):
+            mock_settings.GOOGLE_MAPS_API_KEY = "fake-key"
+            response = await service.process_text(
+                "add location: Blue Bottle Coffee",
+                last_event_context={
+                    "event_id": "ev1", "event_summary": "Coffee",
+                    "event_date": "2026-02-08", "event_time": "10:00",
+                },
+            )
+
+        assert isinstance(response, SuccessResponse)
+        assert response.event.maps_url != ""
+        assert response.event.location != ""
+
+    @pytest.mark.asyncio
+    async def test_modify_calendar_error(self):
+        """Calendar error during modify → error response."""
+        from src.core.parser import ModifyEvent
+        from src.ports.calendar_port import CalendarError
+
+        service, cal = _make_service()
+        cal.update_event_fields = AsyncMock(side_effect=CalendarError("API error"))
+
+        parsed = ModifyEvent(
+            add_location="Blue Bottle",
+            event_id="ev1", event_summary="Meeting",
+            event_date="2026-02-08", event_time="14:00",
+        )
+
+        with patch("src.core.parser.parse_message", AsyncMock(return_value=[parsed])):
+            response = await service.process_text(
+                "add location",
+                last_event_context={
+                    "event_id": "ev1", "event_summary": "Meeting",
+                    "event_date": "2026-02-08", "event_time": "14:00",
+                },
+            )
+
+        assert isinstance(response, ErrorResponse)
+        assert "update" in response.message.lower()
+
+    @pytest.mark.asyncio
+    async def test_process_text_injects_context_into_modify(self):
+        """process_text injects last_event_context into ModifyEvent."""
+        from src.core.parser import ModifyEvent
+
+        service, cal = _make_service()
+        cal.update_event_fields = AsyncMock(return_value={"id": "ev1", "htmlLink": ""})
+
+        # LLM returns a ModifyEvent without bot-injected fields
+        parsed = ModifyEvent(add_location="New Place")
+
+        with patch("src.core.parser.parse_message", AsyncMock(return_value=[parsed])):
+            response = await service.process_text(
+                "add location: New Place",
+                last_event_context={
+                    "event_id": "ev1", "event_summary": "Meeting",
+                    "event_date": "2026-02-08", "event_time": "14:00",
+                },
+            )
+
+        assert isinstance(response, SuccessResponse)
+        assert response.event.event_id == "ev1"
+        assert response.event.summary == "Meeting"
+
+    @pytest.mark.asyncio
+    async def test_modify_remove_guests(self):
+        """Modify remove_guests → calls update_event_fields with remove_guests."""
+        from src.core.parser import ModifyEvent
+
+        service, cal = _make_service()
+        cal.update_event_fields = AsyncMock(return_value={"id": "ev1", "htmlLink": ""})
+
+        parsed = ModifyEvent(
+            remove_guests=["dan@email.com"],
+            event_id="ev1", event_summary="Meeting",
+            event_date="2026-02-08", event_time="14:00",
+        )
+
+        with patch("src.core.parser.parse_message", AsyncMock(return_value=[parsed])):
+            response = await service.process_text(
+                "remove dan@email.com",
+                last_event_context={
+                    "event_id": "ev1", "event_summary": "Meeting",
+                    "event_date": "2026-02-08", "event_time": "14:00",
+                },
+            )
+
+        assert isinstance(response, SuccessResponse)
+        assert "removed" in response.message
+        assert "dan@email.com" in response.message
+
+    @pytest.mark.asyncio
+    async def test_modify_description_success(self):
+        """Modify description → calls update_event_fields with description."""
+        from src.core.parser import ModifyEvent
+
+        service, cal = _make_service()
+        cal.update_event_fields = AsyncMock(return_value={"id": "ev1", "htmlLink": ""})
+
+        parsed = ModifyEvent(
+            new_description="Bring laptop",
+            event_id="ev1", event_summary="Meeting",
+            event_date="2026-02-08", event_time="14:00",
+        )
+
+        with patch("src.core.parser.parse_message", AsyncMock(return_value=[parsed])):
+            response = await service.process_text(
+                "add description: Bring laptop",
+                last_event_context={
+                    "event_id": "ev1", "event_summary": "Meeting",
+                    "event_date": "2026-02-08", "event_time": "14:00",
+                },
+            )
+
+        assert isinstance(response, SuccessResponse)
+        assert "description updated" in response.message
+        call_kwargs = cal.update_event_fields.call_args[1]
+        assert call_kwargs["description"] == "Bring laptop"
+
+
+# ---------------------------------------------------------------------------
+# EventInfo event_id tracking
+# ---------------------------------------------------------------------------
+
+
+class TestEventIdTracking:
+    @pytest.mark.asyncio
+    async def test_create_captures_event_id(self):
+        """SuccessResponse from create includes event_id."""
+        from src.core.parser import ParsedEvent
+        from src.core.conflict_checker import ConflictResult
+
+        service, cal = _make_service()
+        cal.add_event = AsyncMock(return_value={"id": "new-ev-123", "htmlLink": ""})
+
+        parsed = ParsedEvent(event="Lunch", date="2026-02-08", time="12:00")
+        no_conflict = ConflictResult(has_conflict=False)
+
+        with patch("src.core.parser.parse_message", AsyncMock(return_value=[parsed])), \
+             patch("src.core.conflict_checker.check_conflict", AsyncMock(return_value=no_conflict)):
+            response = await service.process_text("Lunch at noon")
+
+        assert isinstance(response, SuccessResponse)
+        assert response.event.event_id == "new-ev-123"
+
+    @pytest.mark.asyncio
+    async def test_reschedule_captures_event_id(self):
+        """SuccessResponse from reschedule includes event_id."""
+        from src.core.parser import RescheduleEvent
+        from src.core.conflict_checker import ConflictResult
+
+        service, cal = _make_service()
+        events = [{"summary": "Meeting", "id": "ev99", "start_time": "2026-02-08T14:00:00", "end_time": "2026-02-08T15:00:00"}]
+        cal.find_events = AsyncMock(return_value=events)
+        cal.update_event = AsyncMock(return_value={"id": "ev99", "htmlLink": "", "summary": "Meeting"})
+
+        parsed = RescheduleEvent(event_summary="Meeting", original_date="2026-02-08", new_time="16:00")
+        no_conflict = ConflictResult(has_conflict=False)
+
+        with patch("src.core.parser.parse_message", AsyncMock(return_value=[parsed])), \
+             patch("src.core.parser.match_event", AsyncMock(return_value=events[0])), \
+             patch("src.core.conflict_checker.check_conflict", AsyncMock(return_value=no_conflict)), \
+             patch("src.core.conflict_checker.extract_event_duration_minutes", return_value=60):
+            response = await service.process_text("Move meeting to 16:00")
+
+        assert isinstance(response, SuccessResponse)
+        assert response.event.event_id == "ev99"

@@ -603,7 +603,7 @@ class TestProcessTextDelegation:
 
         await _process_text("Meeting at 14:00", update, context)
 
-        mock_service.process_text.assert_called_once_with("Meeting at 14:00")
+        mock_service.process_text.assert_called_once_with("Meeting at 14:00", last_event_context=None)
         update.message.reply_text.assert_called()
 
     @pytest.mark.asyncio
@@ -1206,7 +1206,7 @@ class TestSlotTextInput:
         # Should have cleared slot state and processed normally
         assert "pending_slot" not in context.user_data
         assert "pending_slot_all_free" not in context.user_data
-        mock_service.process_text.assert_called_once_with("never mind, forget it")
+        mock_service.process_text.assert_called_once_with("never mind, forget it")  # No last_event_context in slot fallback
 
 
 # ---------------------------------------------------------------------------
