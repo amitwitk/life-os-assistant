@@ -57,6 +57,7 @@ def _build_vevent(
     uid: str | None = None,
     rrule: str | None = None,
     attendees: list[str] | None = None,
+    location: str | None = None,
 ) -> str:
     """Build an iCalendar VEVENT string."""
     cal = iCalendar()
@@ -69,6 +70,9 @@ def _build_vevent(
     event.add("description", description)
     event.add("dtstart", start_dt)
     event.add("dtend", end_dt)
+
+    if location:
+        event.add("location", location)
 
     if rrule:
         # Parse RRULE string like "FREQ=DAILY;COUNT=7" into dict
@@ -157,6 +161,7 @@ class CalDAVCalendarAdapter:
             end_dt=end_dt,
             uid=uid,
             attendees=parsed_event.guests or None,
+            location=parsed_event.location or None,
         )
 
         try:

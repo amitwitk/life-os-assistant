@@ -465,11 +465,13 @@ class TestIntentRegistry:
 
 class TestSchemaPrompt:
     def test_prompt_includes_all_fields(self):
-        """Every model field name appears in the auto-generated prompt."""
-        from src.core.parser import _SYSTEM_PROMPT, INTENT_REGISTRY
+        """Every non-hidden model field name appears in the auto-generated prompt."""
+        from src.core.parser import _SYSTEM_PROMPT, INTENT_REGISTRY, _is_prompt_hidden
 
         for intent, model_cls in INTENT_REGISTRY.items():
-            for field_name in model_cls.model_fields:
+            for field_name, field_info in model_cls.model_fields.items():
+                if _is_prompt_hidden(field_info):
+                    continue
                 assert field_name in _SYSTEM_PROMPT, (
                     f"Field '{field_name}' from {model_cls.__name__} not found in prompt"
                 )
@@ -526,3 +528,37 @@ class TestLogSummary:
         a = AddGuests(event_summary="Meeting", date="2026-02-14", guests=["dan@email.com"])
         assert "Meeting" in a.log_summary
         assert "add-guests" in a.log_summary
+
+
+# ---------------------------------------------------------------------------
+# Tests for location field
+# ---------------------------------------------------------------------------
+
+
+class TestLocationField:
+    def test_parsed_event_location_default_empty(self):
+        """Location defaults to empty string."""
+        p = ParsedEvent(event="Lunch", date="2026-02-14", time="12:00")
+        assert p.location == ""
+        assert p.maps_url == ""
+
+    @pytest.mark.asyncio
+    async def test_parse_event_with_location(self):
+        llm_response = '[{"intent": "create", "event": "Coffee", "date": "2026-02-14", "time": "10:00", "duration_minutes": 60, "description": "", "location": "Blue Bottle Coffee"}]'
+        with patch("src.core.parser.complete", AsyncMock(return_value=llm_response)):
+            result = await parse_message("Coffee at Blue Bottle tomorrow at 10")
+        assert len(result) == 1
+        assert isinstance(result[0], ParsedEvent)
+        assert result[0].location == "Blue Bottle Coffee"
+
+    def test_maps_url_is_prompt_hidden(self):
+        """maps_url should be hidden from the LLM prompt."""
+        from src.core.parser import _is_prompt_hidden
+        field_info = ParsedEvent.model_fields["maps_url"]
+        assert _is_prompt_hidden(field_info)
+
+    def test_location_is_not_prompt_hidden(self):
+        """location should appear in the LLM prompt."""
+        from src.core.parser import _is_prompt_hidden
+        field_info = ParsedEvent.model_fields["location"]
+        assert not _is_prompt_hidden(field_info)

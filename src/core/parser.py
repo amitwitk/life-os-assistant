@@ -48,6 +48,8 @@ class ParsedEvent(BaseModel):
     description: str = Field(default="", description="Optional event description")
     guests: list[str] = Field(default_factory=list, description="Explicit email addresses to invite")
     mentioned_contacts: list[str] = Field(default_factory=list, description="Person names mentioned as participants, to resolve via contacts DB")
+    location: str = Field(default="", description="Physical venue, address, or place name. Empty string if not specified")
+    maps_url: str = Field(default="", json_schema_extra={"prompt_hidden": True})
 
     @property
     def log_summary(self) -> str:
@@ -195,6 +197,7 @@ _BEHAVIORAL_RULES: dict[str, list[str]] = {
         'This includes cases where the user asks when they are free or available (e.g., "meeting with Shon today", "אני רוצה להיפגש עם שון היום מתי אני פנוי", "I want to meet Dan tomorrow, when am I available?"). These are CREATE intents with "time": "", NOT query intents.',
         'Interpret relative dates ("tomorrow", "next Monday") relative to today.',
         '"mentioned_contacts" = list of people\'s NAMES mentioned as participants.\n  e.g., "meeting with Yahav and Dan" → ["Yahav", "Dan"]. Default to [].\n  Only include actual person names, not generic descriptions like "the team".',
+        'Only extract "location" if the user mentions a specific place (e.g., "at Blue Bottle Coffee", "in the office"). Default to "".',
     ],
     "cancel": [
         'If the user mentions canceling MULTIPLE specific events, return a separate cancel object for each.',
@@ -209,10 +212,20 @@ _BEHAVIORAL_RULES: dict[str, list[str]] = {
 }
 
 
+def _is_prompt_hidden(field_info: object) -> bool:
+    """Check if a field is marked as prompt_hidden via json_schema_extra."""
+    extra = field_info.json_schema_extra
+    if isinstance(extra, dict):
+        return extra.get("prompt_hidden", False)
+    return False
+
+
 def _generate_schema_line(intent: str, model_cls: type[BaseModel]) -> str:
     """Auto-generate the JSON schema example line from a Pydantic model."""
     parts: list[str] = []
     for name, field_info in model_cls.model_fields.items():
+        if _is_prompt_hidden(field_info):
+            continue
         annotation = field_info.annotation
         # Determine placeholder value based on type
         if name == "intent":
@@ -232,7 +245,7 @@ def _generate_field_docs(model_cls: type[BaseModel]) -> list[str]:
     """Auto-generate field documentation lines from Field descriptions."""
     lines: list[str] = []
     for name, field_info in model_cls.model_fields.items():
-        if name == "intent":
+        if name == "intent" or _is_prompt_hidden(field_info):
             continue
         desc = field_info.description or ""
         lines.append(f'- "{name}" = {desc}')
