@@ -65,6 +65,10 @@ class Settings(BaseModel):
     MORNING_BRIEFING_HOUR: int = 8
     TIMEZONE: str = "Asia/Jerusalem"
 
+    # Nightly Alarm
+    NIGHTLY_ALARM_HOUR: int = 21
+    DEFAULT_PREP_TIME_MINUTES: int = 60
+
     @field_validator("ALLOWED_USER_IDS", mode="before")
     @classmethod
     def parse_user_ids(cls, v: str | list[int]) -> list[int]:
@@ -74,9 +78,9 @@ class Settings(BaseModel):
             return [int(uid.strip()) for uid in v.split(",") if uid.strip()]
         return []
 
-    @field_validator("MORNING_BRIEFING_HOUR", mode="before")
+    @field_validator("MORNING_BRIEFING_HOUR", "NIGHTLY_ALARM_HOUR", "DEFAULT_PREP_TIME_MINUTES", mode="before")
     @classmethod
-    def parse_hour(cls, v: str | int) -> int:
+    def parse_int_setting(cls, v: str | int) -> int:
         return int(v)
 
 
@@ -115,6 +119,8 @@ def _load_settings() -> Settings:
         GOOGLE_MAPS_API_KEY=os.getenv("GOOGLE_MAPS_API_KEY", ""),
         MORNING_BRIEFING_HOUR=os.getenv("MORNING_BRIEFING_HOUR", "8"),
         TIMEZONE=os.getenv("TIMEZONE", "Asia/Jerusalem"),
+        NIGHTLY_ALARM_HOUR=os.getenv("NIGHTLY_ALARM_HOUR", "21"),
+        DEFAULT_PREP_TIME_MINUTES=os.getenv("DEFAULT_PREP_TIME_MINUTES", "60"),
     )
 
 

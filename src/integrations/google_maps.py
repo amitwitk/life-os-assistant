@@ -1,7 +1,10 @@
-"""Google Maps Places API integration — location enrichment.
+"""Google Maps API integration — location enrichment and travel time.
 
 Uses the Places API (New) Text Search endpoint to validate and enrich
 raw location strings with formatted addresses and Google Maps URLs.
+
+Uses the Distance Matrix API to calculate travel time between two
+addresses for alarm time recommendations.
 
 Gracefully degrades: returns None on any failure (no API key, timeout,
 invalid response, etc.).
@@ -72,4 +75,77 @@ async def enrich_location(
         )
     except Exception as exc:
         logger.warning("Google Maps enrichment failed for '%s': %s", raw_location, exc)
+        return None
+
+
+# ---------------------------------------------------------------------------
+# Distance Matrix API — travel time calculation
+# ---------------------------------------------------------------------------
+
+_DISTANCE_MATRIX_URL = "https://maps.googleapis.com/maps/api/distancematrix/json"
+
+
+@dataclass
+class TravelTimeResult:
+    """Result of a successful Distance Matrix API lookup."""
+
+    duration_minutes: int
+    duration_text: str
+    distance_text: str
+
+
+async def get_travel_time(
+    origin: str,
+    destination: str,
+    api_key: str,
+) -> TravelTimeResult | None:
+    """Calculate travel time between two addresses via Distance Matrix API.
+
+    Returns a TravelTimeResult with duration and distance — or None on any failure.
+    """
+    if not origin or not destination or not api_key:
+        return None
+
+    try:
+        async with httpx.AsyncClient(timeout=_TIMEOUT_SECONDS) as client:
+            resp = await client.get(
+                _DISTANCE_MATRIX_URL,
+                params={
+                    "origins": origin,
+                    "destinations": destination,
+                    "key": api_key,
+                },
+            )
+            resp.raise_for_status()
+            data = resp.json()
+
+        if data.get("status") != "OK":
+            logger.warning("Distance Matrix API status: %s", data.get("status"))
+            return None
+
+        rows = data.get("rows", [])
+        if not rows:
+            return None
+
+        element = rows[0].get("elements", [{}])[0]
+        if element.get("status") != "OK":
+            logger.info(
+                "Distance Matrix element status: %s for %s → %s",
+                element.get("status"), origin, destination,
+            )
+            return None
+
+        duration_seconds = element["duration"]["value"]
+        duration_minutes = (duration_seconds + 59) // 60  # round up
+
+        return TravelTimeResult(
+            duration_minutes=duration_minutes,
+            duration_text=element["duration"]["text"],
+            distance_text=element["distance"]["text"],
+        )
+    except Exception as exc:
+        logger.warning(
+            "Distance Matrix API failed for '%s' → '%s': %s",
+            origin, destination, exc,
+        )
         return None

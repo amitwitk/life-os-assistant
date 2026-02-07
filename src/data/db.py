@@ -372,9 +372,16 @@ class UserDB:
                     onboarded         INTEGER NOT NULL DEFAULT 0,
                     invited_by        INTEGER,
                     is_admin          INTEGER NOT NULL DEFAULT 0,
-                    created_at        TEXT NOT NULL
+                    created_at        TEXT NOT NULL,
+                    home_address      TEXT
                 )
             """)
+            # Migrate existing DBs: add new columns if missing
+            existing_cols = {
+                row[1] for row in conn.execute("PRAGMA table_info(users)").fetchall()
+            }
+            if "home_address" not in existing_cols:
+                conn.execute("ALTER TABLE users ADD COLUMN home_address TEXT")
         logger.debug("Users table initialized at %s", self._db_path)
 
     @staticmethod
@@ -383,6 +390,7 @@ class UserDB:
             telegram_user_id=row["telegram_user_id"],
             display_name=row["display_name"],
             calendar_token_json=row["calendar_token_json"],
+            home_address=row["home_address"],
             onboarded=bool(row["onboarded"]),
             invited_by=row["invited_by"],
             is_admin=bool(row["is_admin"]),
@@ -448,6 +456,15 @@ class UserDB:
                 (telegram_user_id,),
             )
         logger.info("User %d marked as onboarded", telegram_user_id)
+
+    def set_home_address(self, telegram_user_id: int, address: str) -> None:
+        """Store a user's home address for travel time calculations."""
+        with self._connect() as conn:
+            conn.execute(
+                "UPDATE users SET home_address = ? WHERE telegram_user_id = ?",
+                (address, telegram_user_id),
+            )
+        logger.info("Home address set for user %d", telegram_user_id)
 
     def list_users(self) -> list[User]:
         """Return all registered users."""

@@ -605,6 +605,7 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "/chores — List all active chores\n"
         "/done <id> — Mark a chore as done\n"
         "/deletechore <id> — Delete a chore and its calendar events\n"
+        "/sethome <address> — Set home address for travel time\n"
         "/setup — Connect your calendar\n"
         "/invite <id> — Invite a new user (admin)\n"
         "/users — List registered users (admin)\n"
@@ -1062,6 +1063,35 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
 
 # ---------------------------------------------------------------------------
+# /sethome — set home address for travel time
+# ---------------------------------------------------------------------------
+
+
+@registered_only
+async def cmd_sethome(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle /sethome <address> — set home address for alarm travel time."""
+    args = context.args
+    if not args:
+        await update.message.reply_text(
+            "Usage: /sethome <your home address>\n"
+            "Example: /sethome 123 Main St, Tel Aviv"
+        )
+        return
+
+    address = " ".join(args)
+    user_db = _get_user_db(context)
+    if user_db is None:
+        await update.message.reply_text("User management is not enabled.")
+        return
+
+    user_db.set_home_address(update.effective_user.id, address)
+    await update.message.reply_text(
+        f"Home address set to: {address}\n"
+        "This will be used for travel time in your nightly alarm."
+    )
+
+
+# ---------------------------------------------------------------------------
 # Admin commands — /invite, /users
 # ---------------------------------------------------------------------------
 
@@ -1355,6 +1385,7 @@ def build_app(
     app.add_handler(CommandHandler("chores", cmd_chores))
     app.add_handler(CommandHandler("done", cmd_done))
     app.add_handler(CommandHandler("deletechore", cmd_deletechore))
+    app.add_handler(CommandHandler("sethome", cmd_sethome))
 
     # Admin commands
     app.add_handler(CommandHandler("invite", cmd_invite))
@@ -1401,6 +1432,9 @@ def build_app(
     # Morning Briefing scheduler — Telegram-specific scheduling logic
     _setup_morning_briefing(app, notifier)
 
+    # Nightly Alarm scheduler
+    _setup_nightly_alarm(app, notifier)
+
     logger.info("Telegram bot application built with %d handlers", len(app.handlers[0]))
     return app
 
@@ -1428,6 +1462,33 @@ def _setup_morning_briefing(
     logger.info(
         "Morning briefing scheduled at %02d:00 %s",
         settings.MORNING_BRIEFING_HOUR,
+        settings.TIMEZONE,
+    )
+
+
+def _setup_nightly_alarm(
+    app: Application,
+    notifier: NotificationPort,
+) -> None:
+    """Register the daily nightly alarm job at NIGHTLY_ALARM_HOUR."""
+    from src.core.scheduler import send_nightly_alarm
+
+    tz = ZoneInfo(settings.TIMEZONE)
+    alarm_time = dt_time(hour=settings.NIGHTLY_ALARM_HOUR, minute=0, tzinfo=tz)
+
+    async def _nightly_alarm_callback(context: ContextTypes.DEFAULT_TYPE) -> None:
+        user_db = context.bot_data.get("user_db")
+        await send_nightly_alarm(notifier, user_db=user_db)
+
+    app.job_queue.run_daily(
+        _nightly_alarm_callback,
+        time=alarm_time,
+        name="nightly_alarm",
+    )
+
+    logger.info(
+        "Nightly alarm scheduled at %02d:00 %s",
+        settings.NIGHTLY_ALARM_HOUR,
         settings.TIMEZONE,
     )
 
