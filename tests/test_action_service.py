@@ -19,6 +19,7 @@ from src.core.action_service import (
     PendingEvent,
     QueryResultResponse,
     ResponseKind,
+    SlotSuggestionResponse,
     SuccessResponse,
 )
 
@@ -863,3 +864,198 @@ class TestProcessTextAddGuests:
         assert response.results[0].action_type == "create"
         assert response.results[1].action_type == "add_guests"
         assert all(r.success for r in response.results)
+
+
+# ---------------------------------------------------------------------------
+# process_text — slot suggestions (missing time)
+# ---------------------------------------------------------------------------
+
+
+class TestProcessTextSlotSuggestion:
+    @pytest.mark.asyncio
+    async def test_empty_time_returns_slot_suggestion(self):
+        from src.core.parser import ParsedEvent
+        from src.core.conflict_checker import FreeSlotResult
+
+        service, cal = _make_service()
+        parsed = ParsedEvent(event="Meeting with Shon", date="2026-02-08", time="")
+        free_result = FreeSlotResult(
+            suggested=["09:00", "12:00", "16:00"],
+            all_available=["09:00", "09:30", "10:00", "12:00", "14:00", "16:00"],
+        )
+
+        with patch("src.core.parser.parse_message", AsyncMock(return_value=[parsed])), \
+             patch("src.core.conflict_checker.get_free_slots", AsyncMock(return_value=free_result)):
+            response = await service.process_text("Meeting with Shon today")
+
+        assert isinstance(response, SlotSuggestionResponse)
+        assert response.kind == ResponseKind.SLOT_SUGGESTION
+        assert len(response.slots) == 3
+        assert response.slots[0].time == "09:00"
+        assert response.pending is not None
+        assert response.pending.pending_type == "create"
+        assert "Meeting with Shon" in response.message
+        assert response.is_flexible is True
+        assert len(response.all_free_slots) == 6
+
+    @pytest.mark.asyncio
+    async def test_with_time_still_creates_normally(self):
+        from src.core.parser import ParsedEvent
+        from src.core.conflict_checker import ConflictResult
+
+        service, cal = _make_service()
+        cal.add_event = AsyncMock(return_value={"htmlLink": "https://cal/1"})
+
+        parsed = ParsedEvent(event="Meeting", date="2026-02-08", time="14:00")
+        no_conflict = ConflictResult(has_conflict=False)
+
+        with patch("src.core.parser.parse_message", AsyncMock(return_value=[parsed])), \
+             patch("src.core.conflict_checker.check_conflict", AsyncMock(return_value=no_conflict)):
+            response = await service.process_text("Meeting at 14:00")
+
+        assert isinstance(response, SuccessResponse)
+        cal.add_event.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_no_slots_available_returns_error(self):
+        from src.core.parser import ParsedEvent
+        from src.core.conflict_checker import FreeSlotResult
+
+        service, cal = _make_service()
+        parsed = ParsedEvent(event="Meeting", date="2026-02-08", time="")
+        empty_result = FreeSlotResult(suggested=[], all_available=[])
+
+        with patch("src.core.parser.parse_message", AsyncMock(return_value=[parsed])), \
+             patch("src.core.conflict_checker.get_free_slots", AsyncMock(return_value=empty_result)):
+            response = await service.process_text("Meeting today")
+
+        assert isinstance(response, ErrorResponse)
+        assert "No available slots" in response.message
+
+    @pytest.mark.asyncio
+    async def test_batch_with_missing_time_fails_that_action(self):
+        from src.core.parser import ParsedEvent
+        from src.core.conflict_checker import ConflictResult
+
+        service, cal = _make_service()
+        cal.add_event = AsyncMock(return_value={"htmlLink": ""})
+
+        actions = [
+            ParsedEvent(event="Meeting A", date="2026-02-08", time="10:00"),
+            ParsedEvent(event="Meeting B", date="2026-02-08", time=""),
+        ]
+        no_conflict = ConflictResult(has_conflict=False)
+
+        with patch("src.core.parser.parse_message", AsyncMock(return_value=actions)), \
+             patch("src.core.conflict_checker.check_conflict", AsyncMock(return_value=no_conflict)):
+            response = await service.process_text("Two meetings")
+
+        assert isinstance(response, BatchSummaryResponse)
+        assert response.results[0].success is True
+        assert response.results[1].success is False
+        assert "No time specified" in response.results[1].error_message
+
+
+# ---------------------------------------------------------------------------
+# select_slot
+# ---------------------------------------------------------------------------
+
+
+class TestSelectSlot:
+    @pytest.mark.asyncio
+    async def test_select_slot_creates_event(self):
+        from src.core.conflict_checker import ConflictResult
+
+        service, cal = _make_service()
+        cal.add_event = AsyncMock(return_value={"htmlLink": "https://cal/1"})
+        no_conflict = ConflictResult(has_conflict=False)
+
+        pending = PendingEvent(
+            pending_type="create",
+            parsed_event_json={
+                "intent": "create", "event": "Meeting with Shon",
+                "date": "2026-02-08", "time": "", "duration_minutes": 60,
+                "description": "", "guests": [],
+            },
+        )
+
+        with patch("src.core.conflict_checker.check_conflict", AsyncMock(return_value=no_conflict)):
+            response = await service.select_slot(pending, "09:00")
+
+        assert isinstance(response, SuccessResponse)
+        assert "09:00" in response.message
+        assert "Meeting with Shon" in response.message
+        cal.add_event.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_select_slot_calendar_error(self):
+        from src.ports.calendar_port import CalendarError
+        from src.core.conflict_checker import ConflictResult
+
+        service, cal = _make_service()
+        cal.add_event = AsyncMock(side_effect=CalendarError("API error"))
+        no_conflict = ConflictResult(has_conflict=False)
+
+        pending = PendingEvent(
+            pending_type="create",
+            parsed_event_json={
+                "intent": "create", "event": "Meeting",
+                "date": "2026-02-08", "time": "", "duration_minutes": 60,
+                "description": "", "guests": [],
+            },
+        )
+
+        with patch("src.core.conflict_checker.check_conflict", AsyncMock(return_value=no_conflict)):
+            response = await service.select_slot(pending, "09:00")
+
+        assert isinstance(response, ErrorResponse)
+
+    @pytest.mark.asyncio
+    async def test_select_slot_conflict_detected(self):
+        from src.core.conflict_checker import ConflictResult
+
+        service, cal = _make_service()
+        conflict = ConflictResult(
+            has_conflict=True,
+            conflicting_events=[{"summary": "Existing meeting"}],
+        )
+
+        pending = PendingEvent(
+            pending_type="create",
+            parsed_event_json={
+                "intent": "create", "event": "Meeting",
+                "date": "2026-02-08", "time": "", "duration_minutes": 60,
+                "description": "", "guests": [],
+            },
+        )
+
+        with patch("src.core.conflict_checker.check_conflict", AsyncMock(return_value=conflict)):
+            response = await service.select_slot(pending, "14:00")
+
+        assert isinstance(response, ErrorResponse)
+        assert "conflicts with" in response.message
+        assert "Existing meeting" in response.message
+
+    @pytest.mark.asyncio
+    async def test_select_slot_unlisted_time_works_if_free(self):
+        """User types a time not in the suggested list — should work if calendar is free."""
+        from src.core.conflict_checker import ConflictResult
+
+        service, cal = _make_service()
+        cal.add_event = AsyncMock(return_value={"htmlLink": ""})
+        no_conflict = ConflictResult(has_conflict=False)
+
+        pending = PendingEvent(
+            pending_type="create",
+            parsed_event_json={
+                "intent": "create", "event": "Meeting",
+                "date": "2026-02-08", "time": "", "duration_minutes": 60,
+                "description": "", "guests": [],
+            },
+        )
+
+        with patch("src.core.conflict_checker.check_conflict", AsyncMock(return_value=no_conflict)):
+            response = await service.select_slot(pending, "14:15")
+
+        assert isinstance(response, SuccessResponse)
+        assert "14:15" in response.message

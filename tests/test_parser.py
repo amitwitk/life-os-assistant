@@ -343,3 +343,25 @@ class TestGuestParsing:
         assert len(result) == 1
         assert isinstance(result[0], AddGuests)
         assert len(result[0].guests) == 2
+
+
+# ---------------------------------------------------------------------------
+# Tests for empty time (slot suggestion trigger)
+# ---------------------------------------------------------------------------
+
+
+class TestEmptyTimeParsing:
+    @pytest.mark.asyncio
+    async def test_parse_create_with_empty_time(self):
+        llm_response = '[{"intent": "create", "event": "Meeting with Shon", "date": "2026-02-14", "time": "", "duration_minutes": 60, "description": ""}]'
+        with patch("src.core.parser.complete", AsyncMock(return_value=llm_response)):
+            result = await parse_message("Meeting with Shon today")
+        assert len(result) == 1
+        assert isinstance(result[0], ParsedEvent)
+        assert result[0].time == ""
+        assert result[0].event == "Meeting with Shon"
+
+    def test_parsed_event_time_defaults_to_empty(self):
+        """ParsedEvent can be created without time — defaults to empty string."""
+        event = ParsedEvent(event="Test", date="2026-02-14")
+        assert event.time == ""

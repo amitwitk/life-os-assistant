@@ -39,6 +39,7 @@ class ResponseKind(Enum):
     QUERY_RESULT = "query_result"
     BATCH_SUMMARY = "batch_summary"
     NO_ACTION = "no_action"
+    SLOT_SUGGESTION = "slot_suggestion"
 
 
 @dataclass
@@ -126,6 +127,20 @@ class QueryResultResponse(ServiceResponse):
 @dataclass
 class BatchSummaryResponse(ServiceResponse):
     results: list[ActionResult] = field(default_factory=list)
+
+
+@dataclass
+class SlotOption:
+    time: str    # "HH:MM"
+    label: str   # "09:00" or "09:00 AM"
+
+
+@dataclass
+class SlotSuggestionResponse(ServiceResponse):
+    slots: list[SlotOption] = field(default_factory=list)
+    pending: PendingEvent | None = None
+    is_flexible: bool = True
+    all_free_slots: list[str] = field(default_factory=list)
 
 
 # ---------------------------------------------------------------------------
@@ -536,6 +551,9 @@ class ActionService:
         )
 
         if isinstance(parsed, ParsedEvent):
+            if not parsed.time:
+                return await self._suggest_slots(parsed)
+
             conflict = await check_conflict(
                 self._calendar, parsed.date, parsed.time, parsed.duration_minutes,
             )
@@ -865,6 +883,14 @@ class ActionService:
         other_results_map: dict[int, ActionResult] = {}
         for idx, action in other_actions:
             if isinstance(action, ParsedEvent):
+                if not action.time:
+                    other_results_map[idx] = ActionResult(
+                        action_type="create",
+                        summary=action.event,
+                        success=False,
+                        error_message="No time specified — send as a single message for slot suggestions",
+                    )
+                    continue
                 try:
                     conflict = await check_conflict(
                         self._calendar, action.date, action.time, action.duration_minutes,
@@ -1085,4 +1111,76 @@ class ActionService:
             options=options,
             conflicting_summaries=clashing,
             pending=pending,
+        )
+
+    # ------------------------------------------------------------------
+    # Public: slot selection
+    # ------------------------------------------------------------------
+
+    async def select_slot(self, pending: PendingEvent, selected_time: str) -> ServiceResponse:
+        """Create an event at the user-selected time slot.
+
+        Re-checks for conflicts before creating (handles stale data and
+        user-typed times that weren't in the suggested list).
+        """
+        from src.core.conflict_checker import check_conflict
+
+        if pending.parsed_event_json:
+            conflict = await check_conflict(
+                self._calendar,
+                pending.parsed_event_json["date"],
+                selected_time,
+                pending.parsed_event_json.get("duration_minutes", 60),
+            )
+            if conflict.has_conflict:
+                clashing = ", ".join(
+                    ev.get("summary", "(no title)") for ev in conflict.conflicting_events
+                )
+                return ErrorResponse(
+                    kind=ResponseKind.ERROR,
+                    message=f"Sorry, {selected_time} conflicts with: {clashing}. Please pick another time.",
+                )
+
+        return await self._execute_pending_event(pending, selected_time)
+
+    # ------------------------------------------------------------------
+    # Internal: suggest slots for missing time
+    # ------------------------------------------------------------------
+
+    async def _suggest_slots(self, parsed: object) -> ServiceResponse:
+        """Suggest free time slots when a create request has no time specified."""
+        from src.core.conflict_checker import get_free_slots
+        from src.core.parser import ParsedEvent
+
+        if not isinstance(parsed, ParsedEvent):
+            return ErrorResponse(
+                kind=ResponseKind.ERROR,
+                message="Internal error: expected ParsedEvent for slot suggestion.",
+            )
+
+        result = await get_free_slots(
+            self._calendar, parsed.date, parsed.duration_minutes,
+        )
+
+        if not result.suggested:
+            return ErrorResponse(
+                kind=ResponseKind.ERROR,
+                message=f"No available slots on {parsed.date} for a {parsed.duration_minutes}-minute event.",
+            )
+
+        slot_options = [SlotOption(time=t, label=t) for t in result.suggested]
+
+        return SlotSuggestionResponse(
+            kind=ResponseKind.SLOT_SUGGESTION,
+            message=(
+                f"I found some available times for *{parsed.event}* on {parsed.date}. "
+                f"Pick one, or type any time that works for you:"
+            ),
+            slots=slot_options,
+            pending=PendingEvent(
+                pending_type="create",
+                parsed_event_json=parsed.model_dump(),
+            ),
+            is_flexible=True,
+            all_free_slots=result.all_available,
         )

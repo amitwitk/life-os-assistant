@@ -41,7 +41,7 @@ class ParsedEvent(BaseModel):
     intent: str = "create"
     event: str
     date: str          # ISO format YYYY-MM-DD
-    time: str          # HH:MM in 24h format
+    time: str = ""     # HH:MM in 24h format, empty if not specified
     duration_minutes: int = 60
     description: str = ""
     guests: list[str] = []
@@ -145,7 +145,8 @@ If the user wants to schedule something, use this JSON schema:
 {{"intent": "create", "event": "string", "date": "YYYY-MM-DD", "time": "HH:MM", "duration_minutes": integer, "description": "string", "guests": ["email@example.com"]}}
 
 - "event" = short title for the calendar event.
-- "time" must be in 24-hour format.
+- "time" must be in 24-hour format. If the user does NOT specify a time, return "time": "".
+- This includes cases where the user asks when they are free or available (e.g., "meeting with Shon today", "אני רוצה להיפגש עם שון היום מתי אני פנוי", "I want to meet Dan tomorrow, when am I available?"). These are CREATE intents with "time": "", NOT query intents.
 - "duration_minutes" defaults to 60 if not mentioned.
 - "guests" = optional list of email addresses to invite. Default to [] if no guests are mentioned.
 - Interpret relative dates ("tomorrow", "next Monday") relative to today.

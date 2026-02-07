@@ -43,6 +43,7 @@ from src.core.action_service import (
     PendingEvent,
     QueryResultResponse,
     ServiceResponse,
+    SlotSuggestionResponse,
     SuccessResponse,
 )
 
@@ -112,6 +113,19 @@ async def _render_response(
             reply_markup=InlineKeyboardMarkup(buttons),
         )
 
+    elif isinstance(response, SlotSuggestionResponse):
+        context.user_data["pending_slot"] = response.pending
+        context.user_data["pending_slot_all_free"] = response.all_free_slots
+        buttons = [
+            [InlineKeyboardButton(opt.label, callback_data=f"slot:{opt.time}")]
+            for opt in response.slots
+        ]
+        buttons.append([InlineKeyboardButton("Cancel", callback_data="slot:cancel")])
+        await update.message.reply_text(
+            response.message, parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup(buttons),
+        )
+
     elif isinstance(response, SuccessResponse):
         msg = response.message
         if response.event and response.event.link:
@@ -136,6 +150,10 @@ async def _process_text(
     """Parse text via ActionService, render the result."""
     if context.user_data.get("awaiting_custom_time"):
         await _handle_custom_time(text, update, context)
+        return
+
+    if context.user_data.get("pending_slot"):
+        await _handle_slot_text_input(text, update, context)
         return
 
     service: ActionService = context.bot_data["action_service"]
@@ -245,6 +263,104 @@ async def _handle_batch_cancel_callback(
         service: ActionService = context.bot_data["action_service"]
         response = await service.confirm_batch_cancel(pending)
         await query.edit_message_text(response.message, parse_mode="Markdown")
+
+
+# ---------------------------------------------------------------------------
+# Slot suggestion callback
+# ---------------------------------------------------------------------------
+
+
+async def _handle_slot_callback(
+    update: Update, context: ContextTypes.DEFAULT_TYPE,
+) -> None:
+    """Handle inline keyboard taps for slot selection."""
+    query = update.callback_query
+    await query.answer()
+
+    user = query.from_user
+    if user is None or user.id not in settings.ALLOWED_USER_IDS:
+        return
+
+    pending = context.user_data.get("pending_slot")
+    if not pending:
+        await query.edit_message_text("No pending slot selection found. Please try again.")
+        return
+
+    # Extract time — use partition to avoid splitting on ":" inside the time value
+    raw_data = query.data
+    selected_time = raw_data[len("slot:"):]
+
+    if selected_time == "cancel":
+        context.user_data.pop("pending_slot", None)
+        context.user_data.pop("pending_slot_all_free", None)
+        await query.edit_message_text("Event creation cancelled.")
+        return
+
+    service: ActionService = context.bot_data["action_service"]
+    response = await service.select_slot(pending, selected_time)
+
+    msg = response.message
+    if isinstance(response, SuccessResponse) and response.event and response.event.link:
+        msg += f"\n[Open in Google Calendar]({response.event.link})"
+    await query.edit_message_text(msg, parse_mode="Markdown")
+
+    context.user_data.pop("pending_slot", None)
+    context.user_data.pop("pending_slot_all_free", None)
+
+
+# ---------------------------------------------------------------------------
+# Slot text input — user types a time instead of tapping a button
+# ---------------------------------------------------------------------------
+
+
+def _clear_slot_data(context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Remove slot-related keys from user_data."""
+    context.user_data.pop("pending_slot", None)
+    context.user_data.pop("pending_slot_all_free", None)
+
+
+async def _handle_slot_text_input(
+    text: str, update: Update, context: ContextTypes.DEFAULT_TYPE,
+) -> None:
+    """Handle user typing a time (or other text) during slot selection.
+
+    If the text contains a time pattern (HH:MM), attempts to create the
+    event at that time. Otherwise, clears slot state and processes normally.
+    """
+    import re
+
+    pending = context.user_data.get("pending_slot")
+    if not pending:
+        return
+
+    # Look for a time pattern anywhere in the text
+    time_match = re.search(r"\b(\d{1,2}:\d{2})\b", text.strip())
+    if not time_match:
+        # Not a time — user moved on. Clear slot state, process normally.
+        _clear_slot_data(context)
+        service: ActionService = context.bot_data["action_service"]
+        response = await service.process_text(text)
+        await _render_response(response, update, context)
+        return
+
+    selected_time = time_match.group(1)
+    # Zero-pad hour for consistency (e.g., "9:00" → "09:00")
+    if len(selected_time.split(":")[0]) == 1:
+        selected_time = "0" + selected_time
+
+    service: ActionService = context.bot_data["action_service"]
+    response = await service.select_slot(pending, selected_time)
+
+    msg = response.message
+    if isinstance(response, SuccessResponse) and response.event and response.event.link:
+        msg += f"\n[Open in Google Calendar]({response.event.link})"
+        await update.message.reply_text(msg, parse_mode="Markdown")
+    elif isinstance(response, ErrorResponse):
+        await update.message.reply_text(response.message)
+    else:
+        await update.message.reply_text(msg, parse_mode="Markdown")
+
+    _clear_slot_data(context)
 
 
 # ---------------------------------------------------------------------------
@@ -775,6 +891,7 @@ def build_app(
     app.add_handler(CallbackQueryHandler(_handle_deletechore_callback, pattern=r"^delchore:\d+$"))
     app.add_handler(CallbackQueryHandler(_handle_conflict_callback, pattern=r"^conflict:"))
     app.add_handler(CallbackQueryHandler(_handle_batch_cancel_callback, pattern=r"^batchcancel:"))
+    app.add_handler(CallbackQueryHandler(_handle_slot_callback, pattern=r"^slot:"))
 
     # /addchore conversation handler
     _text = filters.TEXT & ~filters.COMMAND

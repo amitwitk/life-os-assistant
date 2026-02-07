@@ -30,6 +30,8 @@ from src.core.action_service import (
     PendingEvent,
     QueryResultResponse,
     ResponseKind,
+    SlotOption,
+    SlotSuggestionResponse,
     SuccessResponse,
     ActionResult,
 )
@@ -921,3 +923,285 @@ class TestBatchCancelCallback:
 
         update.callback_query.edit_message_text.assert_called_with("Batch cancel aborted.")
         assert "pending_batch_cancel" not in context.user_data
+
+
+# ---------------------------------------------------------------------------
+# Tests for slot suggestion rendering
+# ---------------------------------------------------------------------------
+
+
+class TestSlotSuggestionRendering:
+    @pytest.mark.asyncio
+    async def test_render_slot_suggestion_stores_pending_and_all_free(self):
+        from src.bot.telegram_bot import _render_response
+
+        pending = PendingEvent(pending_type="create")
+        all_free = ["09:00", "09:30", "10:00", "12:00", "14:00"]
+        response = SlotSuggestionResponse(
+            kind=ResponseKind.SLOT_SUGGESTION,
+            message="Pick a slot:",
+            slots=[
+                SlotOption(time="09:00", label="09:00"),
+                SlotOption(time="12:00", label="12:00"),
+                SlotOption(time="14:00", label="14:00"),
+            ],
+            pending=pending,
+            all_free_slots=all_free,
+        )
+        update = _make_update("test")
+        context = _make_context()
+
+        await _render_response(response, update, context)
+
+        # Should store pending and all_free_slots in user_data
+        assert context.user_data["pending_slot"] is pending
+        assert context.user_data["pending_slot_all_free"] == all_free
+        # Should send message with inline keyboard
+        call_kwargs = update.message.reply_text.call_args
+        assert "Pick a slot" in call_kwargs[0][0]
+        assert call_kwargs[1]["reply_markup"] is not None
+
+    @pytest.mark.asyncio
+    async def test_render_slot_suggestion_has_cancel_button(self):
+        from src.bot.telegram_bot import _render_response
+        from telegram import InlineKeyboardMarkup
+
+        pending = PendingEvent(pending_type="create")
+        response = SlotSuggestionResponse(
+            kind=ResponseKind.SLOT_SUGGESTION,
+            message="Pick a slot:",
+            slots=[SlotOption(time="09:00", label="09:00")],
+            pending=pending,
+        )
+        update = _make_update("test")
+        context = _make_context()
+
+        await _render_response(response, update, context)
+
+        call_kwargs = update.message.reply_text.call_args
+        markup = call_kwargs[1]["reply_markup"]
+        # Last button row should be Cancel
+        all_buttons = [btn for row in markup.inline_keyboard for btn in row]
+        cancel_buttons = [b for b in all_buttons if b.callback_data == "slot:cancel"]
+        assert len(cancel_buttons) == 1
+
+
+# ---------------------------------------------------------------------------
+# Tests for slot callback handler
+# ---------------------------------------------------------------------------
+
+
+class TestSlotCallbackHandler:
+    def _make_callback_update(self, callback_data, user_id=12345):
+        update = MagicMock()
+        update.callback_query.data = callback_data
+        update.callback_query.from_user.id = user_id
+        update.callback_query.answer = AsyncMock()
+        update.callback_query.edit_message_text = AsyncMock()
+        return update
+
+    @pytest.mark.asyncio
+    async def test_slot_callback_creates_event(self):
+        from src.bot.telegram_bot import _handle_slot_callback
+
+        mock_service = _make_service()
+        mock_service.select_slot = AsyncMock(
+            return_value=SuccessResponse(
+                kind=ResponseKind.SUCCESS,
+                message="Event created at 09:00",
+                event=EventInfo(summary="Meeting", date="2026-02-08", time="09:00", link="https://cal/1"),
+            )
+        )
+
+        pending = PendingEvent(
+            pending_type="create",
+            parsed_event_json={
+                "intent": "create", "event": "Meeting", "date": "2026-02-08",
+                "time": "", "duration_minutes": 60, "description": "",
+            },
+        )
+
+        update = self._make_callback_update("slot:09:00")
+        context = _make_context(service=mock_service)
+        context.user_data["pending_slot"] = pending
+        context.user_data["pending_slot_all_free"] = ["09:00", "10:00"]
+
+        await _handle_slot_callback(update, context)
+
+        mock_service.select_slot.assert_called_once_with(pending, "09:00")
+        assert "pending_slot" not in context.user_data
+        assert "pending_slot_all_free" not in context.user_data
+        call_text = update.callback_query.edit_message_text.call_args[0][0]
+        assert "09:00" in call_text
+
+    @pytest.mark.asyncio
+    async def test_slot_callback_cancel(self):
+        from src.bot.telegram_bot import _handle_slot_callback
+
+        pending = PendingEvent(pending_type="create")
+
+        update = self._make_callback_update("slot:cancel")
+        context = _make_context()
+        context.user_data["pending_slot"] = pending
+        context.user_data["pending_slot_all_free"] = ["09:00"]
+
+        await _handle_slot_callback(update, context)
+
+        assert "pending_slot" not in context.user_data
+        assert "pending_slot_all_free" not in context.user_data
+        update.callback_query.edit_message_text.assert_called_with("Event creation cancelled.")
+
+    @pytest.mark.asyncio
+    async def test_slot_callback_no_pending(self):
+        from src.bot.telegram_bot import _handle_slot_callback
+
+        update = self._make_callback_update("slot:09:00")
+        context = _make_context()
+        # No pending_slot set
+
+        await _handle_slot_callback(update, context)
+
+        update.callback_query.edit_message_text.assert_called_with(
+            "No pending slot selection found. Please try again."
+        )
+
+    @pytest.mark.asyncio
+    async def test_slot_callback_unauthorized_ignored(self):
+        from src.bot.telegram_bot import _handle_slot_callback
+
+        pending = PendingEvent(pending_type="create")
+
+        update = self._make_callback_update("slot:09:00", user_id=99999)
+        context = _make_context()
+        context.user_data["pending_slot"] = pending
+
+        await _handle_slot_callback(update, context)
+
+        # Should not edit message or clear pending
+        update.callback_query.edit_message_text.assert_not_called()
+        assert "pending_slot" in context.user_data
+
+
+# ---------------------------------------------------------------------------
+# Tests for slot text input handler
+# ---------------------------------------------------------------------------
+
+
+class TestSlotTextInput:
+    @pytest.mark.asyncio
+    async def test_typed_time_creates_event(self):
+        from src.bot.telegram_bot import _process_text
+
+        mock_service = _make_service()
+        mock_service.select_slot = AsyncMock(
+            return_value=SuccessResponse(
+                kind=ResponseKind.SUCCESS,
+                message="Event created at 14:00",
+                event=EventInfo(summary="Meeting", date="2026-02-08", time="14:00", link=""),
+            )
+        )
+
+        pending = PendingEvent(
+            pending_type="create",
+            parsed_event_json={
+                "intent": "create", "event": "Meeting", "date": "2026-02-08",
+                "time": "", "duration_minutes": 60, "description": "",
+            },
+        )
+
+        update = _make_update("14:00")
+        context = _make_context(service=mock_service)
+        context.user_data["pending_slot"] = pending
+        context.user_data["pending_slot_all_free"] = ["09:00", "14:00"]
+
+        await _process_text("14:00", update, context)
+
+        mock_service.select_slot.assert_called_once_with(pending, "14:00")
+        assert "pending_slot" not in context.user_data
+        assert "pending_slot_all_free" not in context.user_data
+
+    @pytest.mark.asyncio
+    async def test_typed_time_in_sentence(self):
+        """User types 'Actually, let's do 14:00' — time should be extracted."""
+        from src.bot.telegram_bot import _process_text
+
+        mock_service = _make_service()
+        mock_service.select_slot = AsyncMock(
+            return_value=SuccessResponse(
+                kind=ResponseKind.SUCCESS,
+                message="Event created at 14:00",
+            )
+        )
+
+        pending = PendingEvent(
+            pending_type="create",
+            parsed_event_json={
+                "intent": "create", "event": "Meeting", "date": "2026-02-08",
+                "time": "", "duration_minutes": 60, "description": "",
+            },
+        )
+
+        update = _make_update("Actually, let's do 14:00")
+        context = _make_context(service=mock_service)
+        context.user_data["pending_slot"] = pending
+        context.user_data["pending_slot_all_free"] = ["14:00"]
+
+        await _process_text("Actually, let's do 14:00", update, context)
+
+        mock_service.select_slot.assert_called_once_with(pending, "14:00")
+
+    @pytest.mark.asyncio
+    async def test_typed_single_digit_hour_zero_padded(self):
+        """User types '9:00' — should be normalized to '09:00'."""
+        from src.bot.telegram_bot import _process_text
+
+        mock_service = _make_service()
+        mock_service.select_slot = AsyncMock(
+            return_value=SuccessResponse(
+                kind=ResponseKind.SUCCESS,
+                message="Event created at 09:00",
+            )
+        )
+
+        pending = PendingEvent(
+            pending_type="create",
+            parsed_event_json={
+                "intent": "create", "event": "Meeting", "date": "2026-02-08",
+                "time": "", "duration_minutes": 60, "description": "",
+            },
+        )
+
+        update = _make_update("9:00")
+        context = _make_context(service=mock_service)
+        context.user_data["pending_slot"] = pending
+
+        await _process_text("9:00", update, context)
+
+        mock_service.select_slot.assert_called_once_with(pending, "09:00")
+
+    @pytest.mark.asyncio
+    async def test_non_time_text_clears_slot_and_processes_normally(self):
+        """User sends non-time text — should clear slot state and process normally."""
+        from src.bot.telegram_bot import _process_text
+
+        mock_service = _make_service()
+        mock_service.process_text = AsyncMock(
+            return_value=NoActionResponse(
+                kind=ResponseKind.NO_ACTION,
+                message="No actions found",
+            )
+        )
+
+        pending = PendingEvent(pending_type="create")
+
+        update = _make_update("never mind, forget it")
+        context = _make_context(service=mock_service)
+        context.user_data["pending_slot"] = pending
+        context.user_data["pending_slot_all_free"] = ["09:00"]
+
+        await _process_text("never mind, forget it", update, context)
+
+        # Should have cleared slot state and processed normally
+        assert "pending_slot" not in context.user_data
+        assert "pending_slot_all_free" not in context.user_data
+        mock_service.process_text.assert_called_once_with("never mind, forget it")
