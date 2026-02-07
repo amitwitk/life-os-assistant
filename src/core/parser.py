@@ -2,10 +2,11 @@
 LifeOS Assistant — LLM Parser.
 
 Brain of the Capture System: converts natural language (Hebrew/English)
-into structured calendar events using the configured LLM provider.
+into structured calendar actions using the configured LLM provider.
 
-The parser ALWAYS outputs a calendar event. There is no intent routing.
-Chores are added only via the explicit /addchore command.
+A single message may produce multiple actions (create, cancel, reschedule,
+query, cancel-all-except). Chores are added only via the explicit /addchore
+command.
 """
 
 from __future__ import annotations
@@ -90,7 +91,22 @@ class QueryEvents(BaseModel):
     date: str  # ISO format YYYY-MM-DD
 
 
-ParserResponse = ParsedEvent | CancelEvent | RescheduleEvent | QueryEvents
+class CancelAllExcept(BaseModel):
+    """Cancel all events on a date except specified ones.
+
+    JSON example:
+    {
+        "intent": "cancel_all_except",
+        "date": "2025-02-14",
+        "exceptions": ["Padel game"]
+    }
+    """
+    intent: str = "cancel_all_except"
+    date: str          # ISO format YYYY-MM-DD
+    exceptions: list[str]  # event descriptions to KEEP
+
+
+ParserResponse = ParsedEvent | CancelEvent | RescheduleEvent | QueryEvents | CancelAllExcept
 
 
 # ---------------------------------------------------------------------------
@@ -99,10 +115,12 @@ ParserResponse = ParsedEvent | CancelEvent | RescheduleEvent | QueryEvents
 
 _SYSTEM_PROMPT = """\
 You are an event extraction engine for a personal assistant.
-Your job: parse the user's natural language message and extract calendar event details.
-The user can either CREATE a new event, CANCEL an existing one, RESCHEDULE an existing one, or QUERY their schedule.
+Your job: parse the user's natural language message and extract ALL calendar actions.
+A single message may contain multiple actions — extract every one of them.
 
 Today's date is {today}.
+
+**ALWAYS return a JSON array** `[]`, even for a single action.
 
 **Function 1: Create Event**
 If the user wants to schedule something, use this JSON schema:
@@ -119,6 +137,7 @@ If the user's message contains keywords like "cancel", "delete", "remove", "בי
 
 - "event_summary" = the name/summary of the event to cancel.
 - "date" = the date of the event to cancel.
+- If the user mentions canceling MULTIPLE specific events, return a separate cancel object for each.
 
 **Function 3: Reschedule Event**
 If the user's message contains keywords like "reschedule", "move", "change time", "לדחות", "להזיז", use this JSON schema:
@@ -135,11 +154,19 @@ If the user's message is asking about their schedule, what meetings they have, w
 - "date" = the date the user is asking about. Interpret relative dates relative to today.
 - If the user says "today", "this week", or doesn't specify a date, default to today's date.
 
+**Function 5: Cancel All Except**
+If the user wants to cancel ALL events on a date EXCEPT specific ones (e.g., "cancel everything today except the padel game"), use this JSON schema:
+{{"intent": "cancel_all_except", "date": "YYYY-MM-DD", "exceptions": ["event to keep 1", "event to keep 2"]}}
+
+- "date" = the date of the events.
+- "exceptions" = list of event descriptions that should NOT be canceled (the ones to keep).
+
 **General Rules:**
 - Support both Hebrew and English input.
-- Always return valid JSON matching one of the schemas above.
-- If the message does NOT contain any actionable event information (neither create, cancel, reschedule, nor query), return exactly: null
-- Return ONLY the JSON object (or null). No markdown, no explanation, no extra text.
+- A single message may contain multiple actions. Extract ALL of them into the array.
+- Always return a valid JSON array matching the schemas above.
+- If the message does NOT contain any actionable event information, return exactly: []
+- Return ONLY the JSON array (or []). No markdown, no explanation, no extra text.
 """
 
 
@@ -237,10 +264,39 @@ async def match_event(user_description: str, events: list[dict]) -> dict | None:
         return None
 
 
-async def parse_message(user_message: str) -> ParserResponse | None:
-    """Parse a user message into a structured calendar event using the configured LLM.
+def _instantiate_action(data: dict) -> ParserResponse | None:
+    """Instantiate a single action dict into its typed model, or None if unknown."""
+    intent = data.get("intent")
 
-    Returns ParsedEvent, CancelEvent, RescheduleEvent, QueryEvents, or None.
+    if intent == "create":
+        parsed = ParsedEvent(**data)
+        logger.info("Parsed event creation: %s on %s at %s", parsed.event, parsed.date, parsed.time)
+        return parsed
+    if intent == "cancel":
+        parsed = CancelEvent(**data)
+        logger.info("Parsed event cancellation: %s on %s", parsed.event_summary, parsed.date)
+        return parsed
+    if intent == "reschedule":
+        parsed = RescheduleEvent(**data)
+        logger.info("Parsed event reschedule: %s on %s to %s", parsed.event_summary, parsed.original_date, parsed.new_time)
+        return parsed
+    if intent == "query":
+        parsed = QueryEvents(**data)
+        logger.info("Parsed event query for %s", parsed.date)
+        return parsed
+    if intent == "cancel_all_except":
+        parsed = CancelAllExcept(**data)
+        logger.info("Parsed cancel-all-except on %s, keeping: %s", parsed.date, parsed.exceptions)
+        return parsed
+
+    _handle_unknown_intent(intent)
+    return None
+
+
+async def parse_message(user_message: str) -> list[ParserResponse]:
+    """Parse a user message into structured calendar actions using the configured LLM.
+
+    Returns a list of ParserResponse objects (may be empty).
     """
     system_prompt = _SYSTEM_PROMPT.format(today=date.today().isoformat())
 
@@ -248,42 +304,136 @@ async def parse_message(user_message: str) -> ParserResponse | None:
         raw_text = await complete(
             system=system_prompt,
             user_message=user_message,
-            max_tokens=256,
+            max_tokens=1024,
         )
         raw_text = _clean_llm_response(raw_text)
         logger.debug("LLM raw response: %s", raw_text)
 
-        if raw_text == "null" or not raw_text:
-            logger.info("No event found in message: %s", user_message[:80])
-            return None
+        if raw_text in ("null", "[]", "") or not raw_text:
+            logger.info("No actions found in message: %s", user_message[:80])
+            return []
 
         data = json.loads(raw_text)
-        intent = data.get("intent")
 
-        if intent == "create":
-            parsed = ParsedEvent(**data)
-            logger.info("Parsed event creation: %s on %s at %s", parsed.event, parsed.date, parsed.time)
-            return parsed
-        if intent == "cancel":
-            parsed = CancelEvent(**data)
-            logger.info("Parsed event cancellation: %s on %s", parsed.event_summary, parsed.date)
-            return parsed
-        if intent == "reschedule":
-            parsed = RescheduleEvent(**data)
-            logger.info("Parsed event reschedule: %s on %s to %s", parsed.event_summary, parsed.original_date, parsed.new_time)
-            return parsed
-        if intent == "query":
-            parsed = QueryEvents(**data)
-            logger.info("Parsed event query for %s", parsed.date)
-            return parsed
+        # Defensive wrapping: if LLM returns a single dict instead of list
+        if isinstance(data, dict):
+            data = [data]
 
-        _handle_unknown_intent(intent)
-        return None
+        if not isinstance(data, list):
+            logger.warning("LLM returned unexpected type: %s", type(data).__name__)
+            return []
+
+        results: list[ParserResponse] = []
+        for item in data:
+            if not isinstance(item, dict):
+                logger.warning("Skipping non-dict item in array: %s", item)
+                continue
+            action = _instantiate_action(item)
+            if action is not None:
+                results.append(action)
+
+        return results
 
     except json.JSONDecodeError as exc:
         _handle_json_decode_error(exc, raw_text)
-        return None
+        return []
     except Exception as exc:
         _handle_generic_parser_error(exc)
-        return None
+        return []
+
+
+# ---------------------------------------------------------------------------
+# Batch event matching
+# ---------------------------------------------------------------------------
+
+_BATCH_MATCH_PROMPT = """\
+You are an event matching engine. The user wants to act on multiple calendar events.
+
+Here are the event descriptions the user mentioned:
+{descriptions_list}
+
+Here are the actual events on their calendar for that date:
+{events_list}
+
+For EACH user description (in order), return the 0-based index of the matching calendar event, or "none" if no event matches.
+Consider: the user's wording may differ from the actual event name. Match by meaning, not exact text.
+
+Return ONLY a JSON array of indices/none values. Example: [0, "none", 2]
+No explanation, no extra text — just the JSON array.
+"""
+
+
+async def batch_match_events(
+    descriptions: list[str], events: list[dict],
+) -> list[dict | None]:
+    """Use the LLM to fuzzy-match multiple event descriptions against calendar events in one call.
+
+    Returns a list of matched event dicts (or None for unmatched) in the same order as descriptions.
+    Falls back to sequential match_event() calls if the LLM response is malformed.
+    """
+    if not events or not descriptions:
+        return [None] * len(descriptions)
+
+    events_list = "\n".join(
+        f"{i}. {ev.get('summary', '(no title)')}" for i, ev in enumerate(events)
+    )
+    descriptions_list = "\n".join(
+        f"{i}. \"{desc}\"" for i, desc in enumerate(descriptions)
+    )
+
+    try:
+        raw = await complete(
+            system=_BATCH_MATCH_PROMPT.format(
+                descriptions_list=descriptions_list,
+                events_list=events_list,
+            ),
+            user_message="Which event indices match?",
+            max_tokens=64,
+        )
+        raw = _clean_llm_response(raw)
+        logger.debug("LLM batch match response: %s", raw)
+
+        indices = json.loads(raw)
+        if not isinstance(indices, list) or len(indices) != len(descriptions):
+            raise ValueError(f"Expected list of length {len(descriptions)}, got {indices}")
+
+        results: list[dict | None] = []
+        for idx in indices:
+            if idx == "none" or idx is None:
+                results.append(None)
+            elif isinstance(idx, int) and 0 <= idx < len(events):
+                results.append(events[idx])
+            else:
+                results.append(None)
+
+        return results
+
+    except Exception as exc:
+        logger.warning("Batch match failed (%s), falling back to sequential matching", exc)
+        results = []
+        for desc in descriptions:
+            matched = await match_event(desc, events)
+            results.append(matched)
+        return results
+
+
+async def batch_exclude_events(
+    exceptions: list[str], events: list[dict],
+) -> list[dict]:
+    """Identify events to CANCEL by excluding the ones the user wants to keep.
+
+    Args:
+        exceptions: Event descriptions the user wants to KEEP.
+        events: All calendar events on the date.
+
+    Returns:
+        Events that should be canceled (all events NOT matching any exception).
+    """
+    if not exceptions:
+        return list(events)
+
+    matched_keeps = await batch_match_events(exceptions, events)
+    keep_ids = {ev["id"] for ev in matched_keeps if ev is not None}
+
+    return [ev for ev in events if ev["id"] not in keep_ids]
 

@@ -420,7 +420,7 @@ class TestConflictResolutionCreate:
         parsed = ParsedEvent(event="Meeting", date="2026-02-08", time="14:00")
         no_conflict = ConflictResult(has_conflict=False)
 
-        with patch("src.core.parser.parse_message", AsyncMock(return_value=parsed)), \
+        with patch("src.core.parser.parse_message", AsyncMock(return_value=[parsed])), \
              patch("src.core.conflict_checker.check_conflict", AsyncMock(return_value=no_conflict)):
             await _process_text("Meeting tomorrow at 14:00", update, context)
 
@@ -447,7 +447,7 @@ class TestConflictResolutionCreate:
             suggested_time="15:00",
         )
 
-        with patch("src.core.parser.parse_message", AsyncMock(return_value=parsed)), \
+        with patch("src.core.parser.parse_message", AsyncMock(return_value=[parsed])), \
              patch("src.core.conflict_checker.check_conflict", AsyncMock(return_value=conflict)):
             await _process_text("Meeting at 14:00", update, context)
 
@@ -493,7 +493,7 @@ class TestConflictResolutionReschedule:
             suggested_time="15:00",
         )
 
-        with patch("src.core.parser.parse_message", AsyncMock(return_value=parsed)), \
+        with patch("src.core.parser.parse_message", AsyncMock(return_value=[parsed])), \
              patch("src.core.parser.match_event", AsyncMock(return_value=matched_event)), \
              patch("src.core.conflict_checker.check_conflict", AsyncMock(return_value=conflict)):
             await _process_text("Reschedule meeting to 14:00", update, context)
@@ -529,7 +529,7 @@ class TestConflictResolutionReschedule:
         )
         no_conflict = ConflictResult(has_conflict=False)
 
-        with patch("src.core.parser.parse_message", AsyncMock(return_value=parsed)), \
+        with patch("src.core.parser.parse_message", AsyncMock(return_value=[parsed])), \
              patch("src.core.parser.match_event", AsyncMock(return_value=matched_event)), \
              patch("src.core.conflict_checker.check_conflict", AsyncMock(return_value=no_conflict)):
             await _process_text("Reschedule meeting to 15:00", update, context)
@@ -736,3 +736,298 @@ class TestCustomTimeHandler:
         # First call is the warning, second is the success message
         calls = update.message.reply_text.call_args_list
         assert any("also conflicts" in str(c) for c in calls)
+
+
+# ---------------------------------------------------------------------------
+# Tests for multi-action processing
+# ---------------------------------------------------------------------------
+
+
+class TestMultiActionProcessing:
+    """Test batch action processing via _process_text."""
+
+    @pytest.mark.asyncio
+    async def test_single_action_preserves_existing_behavior(self):
+        """len(actions)==1 goes through full single-action flow with conflict keyboard."""
+        from src.bot.telegram_bot import _process_text
+        from src.core.parser import ParsedEvent
+        from src.core.conflict_checker import ConflictResult
+
+        mock_cal = MagicMock()
+        mock_cal.add_event = AsyncMock(return_value={"htmlLink": ""})
+
+        update = _make_update("Meeting at 10:00")
+        context = _make_context(calendar=mock_cal)
+
+        parsed = ParsedEvent(event="Meeting", date="2026-02-08", time="10:00")
+        no_conflict = ConflictResult(has_conflict=False)
+
+        with patch("src.core.parser.parse_message", AsyncMock(return_value=[parsed])), \
+             patch("src.core.conflict_checker.check_conflict", AsyncMock(return_value=no_conflict)):
+            await _process_text("Meeting at 10:00", update, context)
+
+        mock_cal.add_event.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_multi_cancel_batch(self):
+        """3 cancels in one message, all succeed."""
+        from src.bot.telegram_bot import _process_text
+        from src.core.parser import CancelEvent
+
+        events = [
+            {"summary": "Meeting with Amit", "id": "1"},
+            {"summary": "Meeting with Shon", "id": "2"},
+            {"summary": "Meeting with Yosi", "id": "3"},
+        ]
+
+        mock_cal = MagicMock()
+        mock_cal.find_events = AsyncMock(return_value=events)
+        mock_cal.delete_event = AsyncMock()
+
+        update = _make_update("Cancel meetings with Amit, Shon and Yosi")
+        context = _make_context(calendar=mock_cal)
+
+        actions = [
+            CancelEvent(event_summary="Meeting with Amit", date="2026-02-08"),
+            CancelEvent(event_summary="Meeting with Shon", date="2026-02-08"),
+            CancelEvent(event_summary="Meeting with Yosi", date="2026-02-08"),
+        ]
+
+        with patch("src.core.parser.parse_message", AsyncMock(return_value=actions)), \
+             patch("src.core.parser.batch_match_events", AsyncMock(return_value=events)):
+            await _process_text("Cancel meetings", update, context)
+
+        assert mock_cal.delete_event.call_count == 3
+        # Should send a batch summary
+        reply_text = update.message.reply_text.call_args[0][0]
+        assert "Processed 3 actions" in reply_text
+
+    @pytest.mark.asyncio
+    async def test_multi_cancel_partial_failure(self):
+        """3 cancels, 1 fails to match."""
+        from src.bot.telegram_bot import _process_text
+        from src.core.parser import CancelEvent
+
+        events = [
+            {"summary": "Meeting with Amit", "id": "1"},
+            {"summary": "Meeting with Shon", "id": "2"},
+        ]
+
+        mock_cal = MagicMock()
+        mock_cal.find_events = AsyncMock(return_value=events)
+        mock_cal.delete_event = AsyncMock()
+
+        update = _make_update("Cancel meetings")
+        context = _make_context(calendar=mock_cal)
+
+        actions = [
+            CancelEvent(event_summary="Meeting with Amit", date="2026-02-08"),
+            CancelEvent(event_summary="Meeting with Shon", date="2026-02-08"),
+            CancelEvent(event_summary="Meeting with Yosi", date="2026-02-08"),
+        ]
+
+        # batch_match returns None for Yosi
+        with patch("src.core.parser.parse_message", AsyncMock(return_value=actions)), \
+             patch("src.core.parser.batch_match_events", AsyncMock(return_value=[events[0], events[1], None])):
+            await _process_text("Cancel meetings", update, context)
+
+        assert mock_cal.delete_event.call_count == 2
+        reply_text = update.message.reply_text.call_args[0][0]
+        assert "Processed 3 actions" in reply_text
+
+    @pytest.mark.asyncio
+    async def test_multi_create_batch(self):
+        """2 creates, no conflicts."""
+        from src.bot.telegram_bot import _process_text
+        from src.core.parser import ParsedEvent
+        from src.core.conflict_checker import ConflictResult
+
+        mock_cal = MagicMock()
+        mock_cal.add_event = AsyncMock(return_value={"htmlLink": ""})
+
+        update = _make_update("Set up two meetings")
+        context = _make_context(calendar=mock_cal)
+
+        actions = [
+            ParsedEvent(event="Meeting with Dan", date="2026-02-08", time="14:00"),
+            ParsedEvent(event="Meeting with Yosi", date="2026-02-08", time="16:00"),
+        ]
+        no_conflict = ConflictResult(has_conflict=False)
+
+        with patch("src.core.parser.parse_message", AsyncMock(return_value=actions)), \
+             patch("src.core.conflict_checker.check_conflict", AsyncMock(return_value=no_conflict)):
+            await _process_text("Set up two meetings", update, context)
+
+        assert mock_cal.add_event.call_count == 2
+        reply_text = update.message.reply_text.call_args[0][0]
+        assert "Processed 2 actions" in reply_text
+
+    @pytest.mark.asyncio
+    async def test_multi_create_with_conflict_skipped(self):
+        """Batch create with conflict is skipped (no interactive keyboard)."""
+        from src.bot.telegram_bot import _process_text
+        from src.core.parser import ParsedEvent
+        from src.core.conflict_checker import ConflictResult
+
+        mock_cal = MagicMock()
+        mock_cal.add_event = AsyncMock(return_value={"htmlLink": ""})
+
+        update = _make_update("Set up two meetings")
+        context = _make_context(calendar=mock_cal)
+
+        actions = [
+            ParsedEvent(event="Meeting A", date="2026-02-08", time="14:00"),
+            ParsedEvent(event="Meeting B", date="2026-02-08", time="16:00"),
+        ]
+        conflict = ConflictResult(
+            has_conflict=True,
+            conflicting_events=[{"summary": "Blocker"}],
+        )
+        no_conflict = ConflictResult(has_conflict=False)
+
+        # First check_conflict call returns conflict, second returns no conflict
+        with patch("src.core.parser.parse_message", AsyncMock(return_value=actions)), \
+             patch("src.core.conflict_checker.check_conflict", AsyncMock(side_effect=[conflict, no_conflict])):
+            await _process_text("Set up two meetings", update, context)
+
+        # Only Meeting B should be created (Meeting A skipped due to conflict)
+        assert mock_cal.add_event.call_count == 1
+        reply_text = update.message.reply_text.call_args[0][0]
+        assert "Processed 2 actions" in reply_text
+
+    @pytest.mark.asyncio
+    async def test_empty_actions_shows_no_actionable_info(self):
+        from src.bot.telegram_bot import _process_text
+
+        update = _make_update("Hello there")
+        context = _make_context()
+
+        with patch("src.core.parser.parse_message", AsyncMock(return_value=[])):
+            await _process_text("Hello there", update, context)
+
+        reply_text = update.message.reply_text.call_args[0][0]
+        assert "couldn't find any actionable" in reply_text
+
+    @pytest.mark.asyncio
+    async def test_batch_cancel_same_date_optimization(self):
+        """find_events called once for same date when cancels share a date."""
+        from src.bot.telegram_bot import _process_text
+        from src.core.parser import CancelEvent
+
+        events = [
+            {"summary": "Meeting A", "id": "1"},
+            {"summary": "Meeting B", "id": "2"},
+        ]
+
+        mock_cal = MagicMock()
+        mock_cal.find_events = AsyncMock(return_value=events)
+        mock_cal.delete_event = AsyncMock()
+
+        update = _make_update("Cancel both")
+        context = _make_context(calendar=mock_cal)
+
+        actions = [
+            CancelEvent(event_summary="Meeting A", date="2026-02-08"),
+            CancelEvent(event_summary="Meeting B", date="2026-02-08"),
+        ]
+
+        with patch("src.core.parser.parse_message", AsyncMock(return_value=actions)), \
+             patch("src.core.parser.batch_match_events", AsyncMock(return_value=events)):
+            await _process_text("Cancel both", update, context)
+
+        # find_events should only be called once for the same date
+        mock_cal.find_events.assert_called_once_with(target_date="2026-02-08")
+
+
+# ---------------------------------------------------------------------------
+# Tests for CancelAllExcept flow
+# ---------------------------------------------------------------------------
+
+
+class TestCancelAllExcept:
+    """Test cancel-all-except single-action and batch cancel callback."""
+
+    @pytest.mark.asyncio
+    async def test_cancel_all_except_shows_confirmation(self):
+        """Single-action CancelAllExcept shows confirmation keyboard."""
+        from src.bot.telegram_bot import _process_text
+        from src.core.parser import CancelAllExcept
+
+        events = [
+            {"summary": "Meeting with Amit", "id": "1"},
+            {"summary": "Padel game", "id": "2"},
+            {"summary": "Meeting with Shon", "id": "3"},
+        ]
+        to_cancel = [events[0], events[2]]  # Keep padel, cancel meetings
+
+        mock_cal = MagicMock()
+        mock_cal.find_events = AsyncMock(return_value=events)
+
+        update = _make_update("Cancel everything except padel")
+        context = _make_context(calendar=mock_cal)
+
+        action = CancelAllExcept(date="2026-02-08", exceptions=["Padel game"])
+
+        with patch("src.core.parser.parse_message", AsyncMock(return_value=[action])), \
+             patch("src.core.parser.batch_exclude_events", AsyncMock(return_value=to_cancel)):
+            await _process_text("Cancel everything except padel", update, context)
+
+        # Should store pending batch cancel
+        assert "pending_batch_cancel" in context.user_data
+        assert len(context.user_data["pending_batch_cancel"]) == 2
+
+        # Should show confirmation keyboard
+        reply_call = update.message.reply_text.call_args
+        assert "confirm" in reply_call[0][0].lower() or reply_call[1].get("reply_markup") is not None
+
+    @pytest.mark.asyncio
+    async def test_batch_cancel_confirm_callback(self):
+        """User confirms batch cancel → events are deleted."""
+        from src.bot.telegram_bot import _handle_batch_cancel_callback
+
+        mock_cal = MagicMock()
+        mock_cal.delete_event = AsyncMock()
+
+        update = MagicMock()
+        update.callback_query.data = "batchcancel:confirm"
+        update.callback_query.from_user.id = 12345
+        update.callback_query.answer = AsyncMock()
+        update.callback_query.edit_message_text = AsyncMock()
+
+        context = _make_context(calendar=mock_cal)
+        context.user_data["pending_batch_cancel"] = [
+            {"id": "1", "summary": "Meeting with Amit"},
+            {"id": "3", "summary": "Meeting with Shon"},
+        ]
+
+        await _handle_batch_cancel_callback(update, context)
+
+        assert mock_cal.delete_event.call_count == 2
+        mock_cal.delete_event.assert_any_call("1")
+        mock_cal.delete_event.assert_any_call("3")
+        assert "pending_batch_cancel" not in context.user_data
+
+    @pytest.mark.asyncio
+    async def test_batch_cancel_abort_callback(self):
+        """User aborts batch cancel → no events deleted."""
+        from src.bot.telegram_bot import _handle_batch_cancel_callback
+
+        mock_cal = MagicMock()
+        mock_cal.delete_event = AsyncMock()
+
+        update = MagicMock()
+        update.callback_query.data = "batchcancel:abort"
+        update.callback_query.from_user.id = 12345
+        update.callback_query.answer = AsyncMock()
+        update.callback_query.edit_message_text = AsyncMock()
+
+        context = _make_context(calendar=mock_cal)
+        context.user_data["pending_batch_cancel"] = [
+            {"id": "1", "summary": "Meeting with Amit"},
+        ]
+
+        await _handle_batch_cancel_callback(update, context)
+
+        mock_cal.delete_event.assert_not_called()
+        update.callback_query.edit_message_text.assert_called_with("Batch cancel aborted.")
+        assert "pending_batch_cancel" not in context.user_data
