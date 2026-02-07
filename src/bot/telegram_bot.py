@@ -1,9 +1,10 @@
 """
 LifeOS Assistant — Telegram Bot.
 
-Telegram is the only user interface — the single gateway to LifeOS.
-Every interaction (text capture, voice capture, chore management, daily
-briefings) flows through this bot.
+Thin rendering adapter for the Telegram UI. All business logic lives in
+ActionService; this module only handles Telegram-specific concerns:
+authorization, keyboards, ConversationHandler state, and rendering
+ServiceResponse objects as Telegram messages.
 
 Security-first: unauthorized users are silently ignored.
 """
@@ -12,7 +13,6 @@ from __future__ import annotations
 
 import logging
 import tempfile
-from dataclasses import dataclass, field
 from datetime import time as dt_time
 from functools import wraps
 from pathlib import Path
@@ -31,8 +31,20 @@ from telegram.ext import (
     filters,
 )
 
-from src.ports.calendar_port import CalendarError
 from src.config import settings
+from src.core.action_service import (
+    ActionService,
+    BatchCancelPromptResponse,
+    BatchSummaryResponse,
+    ConflictPromptResponse,
+    ErrorResponse,
+    NoActionResponse,
+    PendingBatchCancel,
+    PendingEvent,
+    QueryResultResponse,
+    ServiceResponse,
+    SuccessResponse,
+)
 
 if TYPE_CHECKING:
     from src.ports.calendar_port import CalendarPort
@@ -68,535 +80,78 @@ def authorized_only(
 
 
 # ---------------------------------------------------------------------------
-# Batch action result
+# Response rendering — maps ServiceResponse → Telegram messages/keyboards
 # ---------------------------------------------------------------------------
 
 
-@dataclass
-class ActionResult:
-    """Result of a single action within a batch."""
-    action_type: str     # "create" | "cancel" | "reschedule" | "query" | "cancel_all_except"
-    summary: str         # human-readable description
-    success: bool
-    error_message: str = ""
+async def _render_response(
+    response: ServiceResponse,
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+) -> None:
+    """Map a ServiceResponse to Telegram messages and keyboards."""
+    if isinstance(response, ConflictPromptResponse):
+        context.user_data["pending_event"] = response.pending
+        buttons = [
+            [InlineKeyboardButton(opt.label, callback_data=f"conflict:{opt.key}")]
+            for opt in response.options
+        ]
+        await update.message.reply_text(
+            response.message, parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup(buttons),
+        )
+
+    elif isinstance(response, BatchCancelPromptResponse):
+        context.user_data["pending_batch_cancel"] = response.pending
+        buttons = [
+            [InlineKeyboardButton("Confirm cancel", callback_data="batchcancel:confirm")],
+            [InlineKeyboardButton("Abort", callback_data="batchcancel:abort")],
+        ]
+        await update.message.reply_text(
+            response.message, parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup(buttons),
+        )
+
+    elif isinstance(response, SuccessResponse):
+        msg = response.message
+        if response.event and response.event.link:
+            msg += f"\n[Open in Google Calendar]({response.event.link})"
+        await update.message.reply_text(msg, parse_mode="Markdown")
+
+    elif isinstance(response, (QueryResultResponse, BatchSummaryResponse)):
+        await update.message.reply_text(response.message, parse_mode="Markdown")
+
+    elif isinstance(response, (NoActionResponse, ErrorResponse)):
+        await update.message.reply_text(response.message)
 
 
 # ---------------------------------------------------------------------------
-# Capture System: parse text → create calendar event
+# Text processing — delegates to ActionService
 # ---------------------------------------------------------------------------
 
 
 async def _process_text(
-    text: str, update: Update, context: ContextTypes.DEFAULT_TYPE
+    text: str, update: Update, context: ContextTypes.DEFAULT_TYPE,
 ) -> None:
-    """Shared logic: parse text via LLM -> execute calendar actions."""
-    from src.core.parser import parse_message
-
-    # Intercept custom time input if awaiting one
+    """Parse text via ActionService, render the result."""
     if context.user_data.get("awaiting_custom_time"):
         await _handle_custom_time(text, update, context)
         return
 
-    try:
-        actions = await parse_message(text)
-    except Exception as exc:
-        logger.error("Parser error: %s", exc)
-        await update.message.reply_text(
-            "Sorry, something went wrong while parsing your message. Please try again."
-        )
-        return
-
-    if not actions:
-        await update.message.reply_text(
-            "I couldn't find any actionable information in your message. "
-            "Try something like: 'Meeting with Dan tomorrow at 14:00', "
-            "'Cancel my meeting with Dan tomorrow', or "
-            "'Reschedule my meeting with Dan tomorrow to 15:00'."
-        )
-        return
-
-    if len(actions) == 1:
-        await _execute_single_action(actions[0], update, context)
-        return
-
-    # Multi-action: process all, collect results, send summary
-    results = await _execute_batch_actions(actions, update, context)
-    await _send_batch_summary(results, update)
+    service: ActionService = context.bot_data["action_service"]
+    response = await service.process_text(text)
+    await _render_response(response, update, context)
 
 
 # ---------------------------------------------------------------------------
-# Single-action execution (full interactive flow with conflict keyboard)
+# Conflict resolution callbacks
 # ---------------------------------------------------------------------------
-
-
-async def _execute_single_action(
-    parsed: "ParserResponse", update: Update, context: ContextTypes.DEFAULT_TYPE,
-) -> None:
-    """Execute a single parsed action with full interactive flow (conflict keyboard, etc.)."""
-    from src.core.conflict_checker import check_conflict, extract_event_duration_minutes
-    from src.core.parser import (
-        CancelAllExcept, CancelEvent, ParsedEvent, QueryEvents, RescheduleEvent,
-        batch_exclude_events, match_event,
-    )
-
-    calendar: CalendarPort = context.bot_data["calendar"]
-
-    if isinstance(parsed, ParsedEvent):
-        conflict = await check_conflict(
-            calendar, parsed.date, parsed.time, parsed.duration_minutes,
-        )
-        if conflict.has_conflict:
-            context.user_data["pending_event"] = {
-                "type": "create",
-                "parsed": parsed,
-            }
-            await _send_conflict_message(update, conflict, parsed.time)
-            return
-
-        try:
-            created = await calendar.add_event(parsed)
-            link = created.get("htmlLink", "")
-            msg = f"✅ Event created: *{parsed.event}* on {parsed.date} at {parsed.time}"
-            if link:
-                msg += f"\n[Open in Google Calendar]({link})"
-            await update.message.reply_text(msg, parse_mode="Markdown")
-        except CalendarError as exc:
-            logger.error("Calendar write error: %s", exc)
-            await update.message.reply_text(
-                "I parsed your event but couldn't save it to Google Calendar. "
-                "Please try again later."
-            )
-    elif isinstance(parsed, CancelEvent):
-        try:
-            all_events = await calendar.find_events(target_date=parsed.date)
-            if not all_events:
-                await update.message.reply_text(
-                    f"There are no events on {parsed.date} to cancel."
-                )
-                return
-
-            matched = await match_event(parsed.event_summary, all_events)
-            if matched is None:
-                summaries = ", ".join(ev["summary"] for ev in all_events)
-                await update.message.reply_text(
-                    f"I couldn't match '{parsed.event_summary}' to any event on {parsed.date}.\n"
-                    f"Events that day: {summaries}"
-                )
-                return
-
-            await calendar.delete_event(matched["id"])
-            await update.message.reply_text(
-                f"✅ Event canceled: *{matched['summary']}*",
-                parse_mode="Markdown",
-            )
-        except CalendarError as exc:
-            logger.error("Calendar delete error: %s", exc)
-            await update.message.reply_text(
-                "I found the event but couldn't cancel it. Please try again later."
-            )
-    elif isinstance(parsed, RescheduleEvent):
-        try:
-            all_events = await calendar.find_events(target_date=parsed.original_date)
-            if not all_events:
-                await update.message.reply_text(
-                    f"There are no events on {parsed.original_date} to reschedule."
-                )
-                return
-
-            matched = await match_event(parsed.event_summary, all_events)
-            if matched is None:
-                summaries = ", ".join(ev["summary"] for ev in all_events)
-                await update.message.reply_text(
-                    f"I couldn't match '{parsed.event_summary}' to any event on {parsed.original_date}.\n"
-                    f"Events that day: {summaries}"
-                )
-                return
-
-            duration = extract_event_duration_minutes(matched)
-            conflict = await check_conflict(
-                calendar, parsed.original_date, parsed.new_time,
-                duration, exclude_event_id=matched["id"],
-            )
-            if conflict.has_conflict:
-                context.user_data["pending_event"] = {
-                    "type": "reschedule",
-                    "event_id": matched["id"],
-                    "date": parsed.original_date,
-                    "time": parsed.new_time,
-                    "duration": duration,
-                    "summary": matched.get("summary", "Unknown Event"),
-                }
-                await _send_conflict_message(update, conflict, parsed.new_time)
-                return
-
-            updated = await calendar.update_event(
-                matched["id"], parsed.original_date, parsed.new_time
-            )
-            link = updated.get("htmlLink", "")
-            msg = (
-                f"✅ Event *{updated.get('summary', 'Unknown Event')}* "
-                f"rescheduled to {parsed.original_date} at {parsed.new_time}"
-            )
-            if link:
-                msg += f"\n[Open in Google Calendar]({link})"
-            await update.message.reply_text(msg, parse_mode="Markdown")
-        except CalendarError as exc:
-            logger.error("Calendar reschedule error: %s", exc)
-            await update.message.reply_text(
-                "I found the event but couldn't reschedule it. Please try again later."
-            )
-    elif isinstance(parsed, QueryEvents):
-        try:
-            events = await calendar.find_events(target_date=parsed.date)
-            if not events:
-                await update.message.reply_text(f"No events scheduled for {parsed.date}.")
-                return
-
-            lines = [f"*Events on {parsed.date}:*\n"]
-            for ev in events:
-                start = ev.get("start_time", "")
-                if "T" in start:
-                    start = start.split("T")[1][:5]
-                end = ev.get("end_time", "")
-                if "T" in end:
-                    end = end.split("T")[1][:5]
-                summary = ev.get("summary", "(no title)")
-                lines.append(f"• {start} – {end}  {summary}")
-
-            await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
-        except CalendarError as exc:
-            logger.error("Calendar query error: %s", exc)
-            await update.message.reply_text(
-                "Couldn't fetch events. Please try again later."
-            )
-    elif isinstance(parsed, CancelAllExcept):
-        try:
-            all_events = await calendar.find_events(target_date=parsed.date)
-            if not all_events:
-                await update.message.reply_text(
-                    f"There are no events on {parsed.date} to cancel."
-                )
-                return
-
-            to_cancel = await batch_exclude_events(parsed.exceptions, all_events)
-            if not to_cancel:
-                await update.message.reply_text(
-                    f"All events on {parsed.date} match your exceptions — nothing to cancel."
-                )
-                return
-
-            keep_names = [
-                ev.get("summary", "(no title)") for ev in all_events if ev not in to_cancel
-            ]
-            cancel_names = [ev.get("summary", "(no title)") for ev in to_cancel]
-
-            msg = "*Cancel all except — please confirm:*\n\n"
-            msg += "*Will cancel:*\n"
-            for name in cancel_names:
-                msg += f"  • {name}\n"
-            if keep_names:
-                msg += "\n*Will keep:*\n"
-                for name in keep_names:
-                    msg += f"  • {name}\n"
-
-            context.user_data["pending_batch_cancel"] = [
-                {"id": ev["id"], "summary": ev.get("summary", "(no title)")} for ev in to_cancel
-            ]
-
-            buttons = [
-                [InlineKeyboardButton("Confirm cancel", callback_data="batchcancel:confirm")],
-                [InlineKeyboardButton("Abort", callback_data="batchcancel:abort")],
-            ]
-            await update.message.reply_text(
-                msg, parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(buttons),
-            )
-        except CalendarError as exc:
-            logger.error("Calendar error during cancel-all-except: %s", exc)
-            await update.message.reply_text(
-                "Something went wrong while processing your request. Please try again later."
-            )
-
-
-# ---------------------------------------------------------------------------
-# Batch action execution (no interactive keyboards, collect results)
-# ---------------------------------------------------------------------------
-
-
-async def _execute_batch_actions(
-    actions: list, update: Update, context: ContextTypes.DEFAULT_TYPE,
-) -> list[ActionResult]:
-    """Process multiple actions sequentially, collecting results for a summary."""
-    from src.core.conflict_checker import check_conflict, extract_event_duration_minutes
-    from src.core.parser import (
-        CancelAllExcept, CancelEvent, ParsedEvent, QueryEvents, RescheduleEvent,
-        batch_exclude_events, batch_match_events, match_event,
-    )
-
-    calendar: CalendarPort = context.bot_data["calendar"]
-    results: list[ActionResult] = []
-
-    # Group cancels by date to optimize find_events calls
-    cancel_actions: list[tuple[int, CancelEvent]] = []
-    other_actions: list[tuple[int, Any]] = []
-    for i, action in enumerate(actions):
-        if isinstance(action, CancelEvent):
-            cancel_actions.append((i, action))
-        else:
-            other_actions.append((i, action))
-
-    # Process grouped cancels: one find_events + one batch_match per date
-    if cancel_actions:
-        cancels_by_date: dict[str, list[tuple[int, CancelEvent]]] = {}
-        for idx, action in cancel_actions:
-            cancels_by_date.setdefault(action.date, []).append((idx, action))
-
-        cancel_results_map: dict[int, ActionResult] = {}
-        for date_str, date_cancels in cancels_by_date.items():
-            try:
-                all_events = await calendar.find_events(target_date=date_str)
-                if not all_events:
-                    for idx, action in date_cancels:
-                        cancel_results_map[idx] = ActionResult(
-                            action_type="cancel",
-                            summary=action.event_summary,
-                            success=False,
-                            error_message=f"No events on {date_str}",
-                        )
-                    continue
-
-                descriptions = [action.event_summary for _, action in date_cancels]
-                matched = await batch_match_events(descriptions, all_events)
-
-                for (idx, action), matched_ev in zip(date_cancels, matched):
-                    if matched_ev is None:
-                        cancel_results_map[idx] = ActionResult(
-                            action_type="cancel",
-                            summary=action.event_summary,
-                            success=False,
-                            error_message="Could not find matching event",
-                        )
-                    else:
-                        try:
-                            await calendar.delete_event(matched_ev["id"])
-                            cancel_results_map[idx] = ActionResult(
-                                action_type="cancel",
-                                summary=matched_ev.get("summary", action.event_summary),
-                                success=True,
-                            )
-                        except CalendarError as exc:
-                            cancel_results_map[idx] = ActionResult(
-                                action_type="cancel",
-                                summary=matched_ev.get("summary", action.event_summary),
-                                success=False,
-                                error_message=str(exc),
-                            )
-            except CalendarError as exc:
-                for idx, action in date_cancels:
-                    cancel_results_map[idx] = ActionResult(
-                        action_type="cancel",
-                        summary=action.event_summary,
-                        success=False,
-                        error_message=str(exc),
-                    )
-
-    # Process other actions sequentially
-    other_results_map: dict[int, ActionResult] = {}
-    for idx, action in other_actions:
-        if isinstance(action, ParsedEvent):
-            try:
-                conflict = await check_conflict(
-                    calendar, action.date, action.time, action.duration_minutes,
-                )
-                if conflict.has_conflict:
-                    clashing = ", ".join(
-                        ev.get("summary", "(no title)") for ev in conflict.conflicting_events
-                    )
-                    other_results_map[idx] = ActionResult(
-                        action_type="create",
-                        summary=action.event,
-                        success=False,
-                        error_message=f"Conflict with: {clashing}",
-                    )
-                    continue
-                await calendar.add_event(action)
-                other_results_map[idx] = ActionResult(
-                    action_type="create", summary=action.event, success=True,
-                )
-            except CalendarError as exc:
-                other_results_map[idx] = ActionResult(
-                    action_type="create", summary=action.event, success=False,
-                    error_message=str(exc),
-                )
-        elif isinstance(action, RescheduleEvent):
-            try:
-                all_events = await calendar.find_events(target_date=action.original_date)
-                matched_ev = await match_event(action.event_summary, all_events) if all_events else None
-                if matched_ev is None:
-                    other_results_map[idx] = ActionResult(
-                        action_type="reschedule", summary=action.event_summary,
-                        success=False, error_message="Could not find matching event",
-                    )
-                    continue
-
-                duration = extract_event_duration_minutes(matched_ev)
-                conflict = await check_conflict(
-                    calendar, action.original_date, action.new_time,
-                    duration, exclude_event_id=matched_ev["id"],
-                )
-                if conflict.has_conflict:
-                    clashing = ", ".join(
-                        ev.get("summary", "(no title)") for ev in conflict.conflicting_events
-                    )
-                    other_results_map[idx] = ActionResult(
-                        action_type="reschedule", summary=action.event_summary,
-                        success=False, error_message=f"Conflict with: {clashing}",
-                    )
-                    continue
-
-                await calendar.update_event(matched_ev["id"], action.original_date, action.new_time)
-                other_results_map[idx] = ActionResult(
-                    action_type="reschedule", summary=action.event_summary, success=True,
-                )
-            except CalendarError as exc:
-                other_results_map[idx] = ActionResult(
-                    action_type="reschedule", summary=action.event_summary,
-                    success=False, error_message=str(exc),
-                )
-        elif isinstance(action, QueryEvents):
-            try:
-                events = await calendar.find_events(target_date=action.date)
-                if not events:
-                    other_results_map[idx] = ActionResult(
-                        action_type="query", summary=f"No events on {action.date}",
-                        success=True,
-                    )
-                else:
-                    lines = []
-                    for ev in events:
-                        start = ev.get("start_time", "")
-                        if "T" in start:
-                            start = start.split("T")[1][:5]
-                        summary = ev.get("summary", "(no title)")
-                        lines.append(f"{start} {summary}")
-                    other_results_map[idx] = ActionResult(
-                        action_type="query", summary="; ".join(lines), success=True,
-                    )
-            except CalendarError as exc:
-                other_results_map[idx] = ActionResult(
-                    action_type="query", summary=f"Query {action.date}",
-                    success=False, error_message=str(exc),
-                )
-        elif isinstance(action, CancelAllExcept):
-            try:
-                all_events = await calendar.find_events(target_date=action.date)
-                if not all_events:
-                    other_results_map[idx] = ActionResult(
-                        action_type="cancel_all_except",
-                        summary=f"No events on {action.date}",
-                        success=False, error_message=f"No events on {action.date}",
-                    )
-                    continue
-
-                to_cancel = await batch_exclude_events(action.exceptions, all_events)
-                if not to_cancel:
-                    other_results_map[idx] = ActionResult(
-                        action_type="cancel_all_except",
-                        summary="Nothing to cancel — all events match exceptions",
-                        success=True,
-                    )
-                    continue
-
-                canceled_names = []
-                for ev in to_cancel:
-                    try:
-                        await calendar.delete_event(ev["id"])
-                        canceled_names.append(ev.get("summary", "(no title)"))
-                    except CalendarError:
-                        pass
-
-                other_results_map[idx] = ActionResult(
-                    action_type="cancel_all_except",
-                    summary=f"Canceled {len(canceled_names)} events",
-                    success=True,
-                )
-            except CalendarError as exc:
-                other_results_map[idx] = ActionResult(
-                    action_type="cancel_all_except",
-                    summary="Cancel all except",
-                    success=False, error_message=str(exc),
-                )
-
-    # Reassemble results in original order
-    all_results_map = {}
-    if cancel_actions:
-        all_results_map.update(cancel_results_map)
-    all_results_map.update(other_results_map)
-
-    return [all_results_map[i] for i in sorted(all_results_map.keys())]
-
-
-async def _send_batch_summary(
-    results: list[ActionResult], update: Update,
-) -> None:
-    """Format and send a summary of batch action results."""
-    lines = [f"*Processed {len(results)} actions:*\n"]
-    for r in results:
-        if r.success:
-            lines.append(f'✅ {r.action_type.replace("_", " ").title()}: "{r.summary}"')
-        else:
-            lines.append(
-                f'❌ {r.action_type.replace("_", " ").title()}: "{r.summary}" — {r.error_message}'
-            )
-    await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
-
-
-# ---------------------------------------------------------------------------
-# Conflict resolution helpers
-# ---------------------------------------------------------------------------
-
-
-async def _send_conflict_message(
-    update: Update,
-    conflict: "ConflictResult",
-    original_time: str,
-) -> None:
-    """Send a conflict notification with resolution options."""
-    from src.core.conflict_checker import ConflictResult
-
-    clashing = ", ".join(
-        ev.get("summary", "(no title)") for ev in conflict.conflicting_events
-    )
-    msg = (
-        f"⚠️ *Time conflict detected!*\n"
-        f"Your requested time ({original_time}) overlaps with: {clashing}"
-    )
-
-    buttons = []
-    if conflict.suggested_time:
-        buttons.append([InlineKeyboardButton(
-            f"Use {conflict.suggested_time}", callback_data="conflict:suggested",
-        )])
-    buttons.append([InlineKeyboardButton(
-        f"Force {original_time}", callback_data="conflict:force",
-    )])
-    buttons.append([InlineKeyboardButton(
-        "Enter custom time", callback_data="conflict:custom",
-    )])
-    buttons.append([InlineKeyboardButton(
-        "Cancel", callback_data="conflict:cancel",
-    )])
-
-    await update.message.reply_text(
-        msg, parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(buttons),
-    )
 
 
 async def _handle_conflict_callback(
-    update: Update, context: ContextTypes.DEFAULT_TYPE
+    update: Update, context: ContextTypes.DEFAULT_TYPE,
 ) -> None:
     """Handle inline keyboard taps for conflict resolution."""
-    from src.core.conflict_checker import ConflictResult
-
     query = update.callback_query
     await query.answer()
 
@@ -623,74 +178,21 @@ async def _handle_conflict_callback(
         )
         return
 
-    calendar: CalendarPort = context.bot_data["calendar"]
+    service: ActionService = context.bot_data["action_service"]
+    response = await service.resolve_conflict(pending, action)
 
-    if action == "suggested":
-        # Use the suggested time from the conflict result
-        # Re-read the suggested time from the keyboard button text
-        suggested_time = None
-        if query.message and query.message.reply_markup:
-            for row in query.message.reply_markup.inline_keyboard:
-                for btn in row:
-                    if btn.callback_data == "conflict:suggested":
-                        # Extract HH:MM from button text like "Use 15:30"
-                        suggested_time = btn.text.replace("Use ", "")
-                        break
-        if not suggested_time:
-            await query.edit_message_text("Could not determine suggested time. Please try again.")
-            context.user_data.pop("pending_event", None)
-            return
-        time_to_use = suggested_time
-    elif action == "force":
-        if pending["type"] == "create":
-            time_to_use = pending["parsed"].time
-        else:
-            time_to_use = pending["time"]
-    else:
-        context.user_data.pop("pending_event", None)
-        return
+    msg = response.message
+    if isinstance(response, SuccessResponse) and response.event and response.event.link:
+        msg += f"\n[Open in Google Calendar]({response.event.link})"
+    await query.edit_message_text(msg, parse_mode="Markdown")
 
-    await _execute_pending_event(pending, time_to_use, calendar, query)
     context.user_data.pop("pending_event", None)
 
 
-async def _execute_pending_event(
-    pending: dict, time_to_use: str, calendar: "CalendarPort", query: Any,
-) -> None:
-    """Execute the pending event creation or reschedule at the given time."""
-    try:
-        if pending["type"] == "create":
-            parsed = pending["parsed"]
-            parsed.time = time_to_use
-            created = await calendar.add_event(parsed)
-            link = created.get("htmlLink", "")
-            msg = f"✅ Event created: *{parsed.event}* on {parsed.date} at {time_to_use}"
-            if link:
-                msg += f"\n[Open in Google Calendar]({link})"
-            await query.edit_message_text(msg, parse_mode="Markdown")
-        else:
-            updated = await calendar.update_event(
-                pending["event_id"], pending["date"], time_to_use,
-            )
-            link = updated.get("htmlLink", "")
-            summary = updated.get("summary", pending.get("summary", "Unknown Event"))
-            msg = f"✅ Event *{summary}* rescheduled to {pending['date']} at {time_to_use}"
-            if link:
-                msg += f"\n[Open in Google Calendar]({link})"
-            await query.edit_message_text(msg, parse_mode="Markdown")
-    except CalendarError as exc:
-        logger.error("Calendar error during conflict resolution: %s", exc)
-        await query.edit_message_text(
-            "Something went wrong while saving the event. Please try again."
-        )
-
-
 async def _handle_custom_time(
-    text: str, update: Update, context: ContextTypes.DEFAULT_TYPE
+    text: str, update: Update, context: ContextTypes.DEFAULT_TYPE,
 ) -> None:
     """Handle user-typed custom time during conflict resolution."""
-    import re
-
     context.user_data.pop("awaiting_custom_time", None)
 
     pending = context.user_data.get("pending_event")
@@ -698,72 +200,16 @@ async def _handle_custom_time(
         await update.message.reply_text("No pending event. Please start over.")
         return
 
-    text = text.strip()
-    if not re.match(r"^\d{1,2}:\d{2}$", text):
-        context.user_data.pop("pending_event", None)
-        await update.message.reply_text(
-            "Invalid time format. Please use HH:MM (e.g. 15:30). Event cancelled."
-        )
-        return
+    service: ActionService = context.bot_data["action_service"]
+    response = await service.resolve_conflict(pending, "custom", custom_time=text)
 
-    calendar: CalendarPort = context.bot_data["calendar"]
-
-    # Re-check conflict at the custom time (warn but proceed)
-    from src.core.conflict_checker import check_conflict
-
-    if pending["type"] == "create":
-        parsed = pending["parsed"]
-        conflict = await check_conflict(
-            calendar, parsed.date, text, parsed.duration_minutes,
-        )
-        if conflict.has_conflict:
-            clashing = ", ".join(
-                ev.get("summary", "(no title)") for ev in conflict.conflicting_events
-            )
-            await update.message.reply_text(
-                f"⚠️ Note: {text} also conflicts with: {clashing}. Proceeding anyway."
-            )
-        parsed.time = text
-        try:
-            created = await calendar.add_event(parsed)
-            link = created.get("htmlLink", "")
-            msg = f"✅ Event created: *{parsed.event}* on {parsed.date} at {text}"
-            if link:
-                msg += f"\n[Open in Google Calendar]({link})"
-            await update.message.reply_text(msg, parse_mode="Markdown")
-        except CalendarError as exc:
-            logger.error("Calendar error during custom time: %s", exc)
-            await update.message.reply_text(
-                "Couldn't save the event. Please try again later."
-            )
-    else:
-        exclude_id = pending.get("event_id")
-        conflict = await check_conflict(
-            calendar, pending["date"], text,
-            pending["duration"], exclude_event_id=exclude_id,
-        )
-        if conflict.has_conflict:
-            clashing = ", ".join(
-                ev.get("summary", "(no title)") for ev in conflict.conflicting_events
-            )
-            await update.message.reply_text(
-                f"⚠️ Note: {text} also conflicts with: {clashing}. Proceeding anyway."
-            )
-        try:
-            updated = await calendar.update_event(
-                pending["event_id"], pending["date"], text,
-            )
-            link = updated.get("htmlLink", "")
-            summary = updated.get("summary", pending.get("summary", "Unknown Event"))
-            msg = f"✅ Event *{summary}* rescheduled to {pending['date']} at {text}"
-            if link:
-                msg += f"\n[Open in Google Calendar]({link})"
-            await update.message.reply_text(msg, parse_mode="Markdown")
-        except CalendarError as exc:
-            logger.error("Calendar error during custom time reschedule: %s", exc)
-            await update.message.reply_text(
-                "Couldn't reschedule the event. Please try again later."
-            )
+    if isinstance(response, SuccessResponse):
+        msg = response.message
+        if response.event and response.event.link:
+            msg += f"\n[Open in Google Calendar]({response.event.link})"
+        await update.message.reply_text(msg, parse_mode="Markdown")
+    elif isinstance(response, ErrorResponse):
+        await update.message.reply_text(response.message)
 
     context.user_data.pop("pending_event", None)
 
@@ -796,25 +242,9 @@ async def _handle_batch_cancel_callback(
             await query.edit_message_text("No pending cancel found. Please try again.")
             return
 
-        calendar: CalendarPort = context.bot_data["calendar"]
-        succeeded = []
-        failed = []
-
-        for ev in pending:
-            try:
-                await calendar.delete_event(ev["id"])
-                succeeded.append(ev["summary"])
-            except CalendarError as exc:
-                logger.error("Failed to cancel '%s': %s", ev["summary"], exc)
-                failed.append(ev["summary"])
-
-        lines = []
-        for name in succeeded:
-            lines.append(f"✅ Canceled: *{name}*")
-        for name in failed:
-            lines.append(f"❌ Failed to cancel: *{name}*")
-
-        await query.edit_message_text("\n".join(lines), parse_mode="Markdown")
+        service: ActionService = context.bot_data["action_service"]
+        response = await service.confirm_batch_cancel(pending)
+        await query.edit_message_text(response.message, parse_mode="Markdown")
 
 
 # ---------------------------------------------------------------------------
@@ -855,36 +285,13 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 @authorized_only
 async def cmd_today(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Handle /today — show today's calendar events."""
-    calendar: CalendarPort = context.bot_data["calendar"]
-
-    try:
-        events = await calendar.get_daily_events()
-    except CalendarError as exc:
-        logger.error("/today calendar error: %s", exc)
-        await update.message.reply_text("Couldn't fetch today's events. Please try again later.")
-        return
-
-    if not events:
-        await update.message.reply_text("No events scheduled for today.")
-        return
-
-    lines = ["*Today's schedule:*\n"]
-    for ev in events:
-        start = ev.get("start_time", "")
-        # Extract HH:MM from ISO datetime
-        if "T" in start:
-            start = start.split("T")[1][:5]
-        end = ev.get("end_time", "")
-        if "T" in end:
-            end = end.split("T")[1][:5]
-        summary = ev.get("summary", "(no title)")
-        lines.append(f"• {start} – {end}  {summary}")
-
-    await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
+    service: ActionService = context.bot_data["action_service"]
+    response = await service.get_today_events()
+    await update.message.reply_text(response.message, parse_mode="Markdown")
 
 
 # ---------------------------------------------------------------------------
-# Chore commands (uses ChoreDB from Phase 4)
+# Chore commands
 # ---------------------------------------------------------------------------
 
 # ConversationHandler states for /addchore
@@ -1029,8 +436,6 @@ async def addchore_time_pref(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
 async def addchore_weeks(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     """Receive weeks ahead, find best recurring slot and present proposal."""
-    from src.core.chore_scheduler import find_best_slot
-
     text = update.message.text.strip()
     try:
         weeks = int(text)
@@ -1042,12 +447,11 @@ async def addchore_weeks(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
     await update.message.reply_text("Finding the best time slot...")
 
-    calendar: CalendarPort = context.bot_data["calendar"]
+    service: ActionService = context.bot_data["action_service"]
 
     try:
-        slot = await find_best_slot(
-            calendar=calendar,
-            chore_name=context.user_data["chore_name"],
+        slot = await service.find_chore_slot(
+            name=context.user_data["chore_name"],
             frequency_days=context.user_data["chore_freq"],
             duration_minutes=context.user_data["chore_duration"],
             preferred_start=context.user_data["chore_time_start"],
@@ -1074,7 +478,7 @@ async def addchore_weeks(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     lines = [
         f"*Proposed recurring schedule for '{context.user_data['chore_name']}':*\n",
         f"  Starting: {slot['start_date']}",
-        f"  Time: {slot['start_time']}–{slot['end_time']}",
+        f"  Time: {slot['start_time']}\u2013{slot['end_time']}",
         f"  Repeats: every {freq} day(s)",
         f"  Occurrences: {slot['occurrences']}",
         "\n_This will create a single recurring calendar event._",
@@ -1095,9 +499,9 @@ async def addchore_weeks(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
 async def addchore_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     """Handle user confirmation — create DB entry and recurring calendar event."""
-    from src.data.db import ChoreDB
+    from src.ports.calendar_port import CalendarError
 
-    calendar: CalendarPort = context.bot_data["calendar"]
+    service: ActionService = context.bot_data["action_service"]
 
     answer = update.message.text.strip().lower()
     if answer not in ("yes", "y"):
@@ -1115,10 +519,9 @@ async def addchore_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     time_end = context.user_data["chore_time_end"]
     slot = context.user_data["chore_slot"]
 
-    # Save chore to DB
+    # Save chore to DB via service
     try:
-        db = ChoreDB()
-        chore = db.add_chore(
+        chore = service.create_chore(
             name=name,
             frequency_days=freq,
             assigned_to=assigned,
@@ -1132,38 +535,27 @@ async def addchore_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         _clear_chore_data(context)
         return ConversationHandler.END
 
-    # Create recurring calendar event
-    try:
-        created = await calendar.add_recurring_event(
-            summary=f"🧹 {name}",
-            description=f"Chore: {name}\nChore ID: {chore.id}",
-            start_date=slot["start_date"],
-            start_time=slot["start_time"],
-            end_time=slot["end_time"],
-            frequency_days=slot["frequency_days"],
-            occurrences=slot["occurrences"],
-        )
-        # Link the calendar event to the chore in DB
-        db.set_calendar_event_id(chore.id, created["id"])
+    # Create recurring calendar event via service
+    cal_response = await service.create_chore_calendar_event(chore, slot)
 
+    if isinstance(cal_response, SuccessResponse):
         times_pw = context.user_data.get("chore_times_per_week", "?")
-        link = created.get("htmlLink", "")
+        link = cal_response.event.link if cal_response.event else ""
         msg = (
-            f"✅ Chore *{name}* scheduled!\n"
-            f"• {times_pw}x per week, {slot['occurrences']} occurrences\n"
-            f"• Time: {slot['start_time']}–{slot['end_time']}\n"
-            f"• Starting: {slot['start_date']}"
+            f"\u2705 Chore *{name}* scheduled!\n"
+            f"\u2022 {times_pw}x per week, {slot['occurrences']} occurrences\n"
+            f"\u2022 Time: {slot['start_time']}\u2013{slot['end_time']}\n"
+            f"\u2022 Starting: {slot['start_date']}"
         )
         if link:
             msg += f"\n[Open in Google Calendar]({link})"
         await update.message.reply_text(
             msg, parse_mode="Markdown", reply_markup=ReplyKeyboardRemove(),
         )
-    except CalendarError as exc:
-        logger.error("Calendar error: %s", exc)
+    else:
         await update.message.reply_text(
-            f"✅ Chore *{name}* saved to DB, but the calendar event "
-            f"couldn't be created. Error: {exc}",
+            f"\u2705 Chore *{name}* saved to DB, but the calendar event "
+            f"couldn't be created. Error: {cal_response.message}",
             parse_mode="Markdown",
             reply_markup=ReplyKeyboardRemove(),
         )
@@ -1195,11 +587,10 @@ def _clear_chore_data(context: ContextTypes.DEFAULT_TYPE) -> None:
 @authorized_only
 async def cmd_chores(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Handle /chores — list all active chores."""
-    from src.data.db import ChoreDB
+    service: ActionService = context.bot_data["action_service"]
 
     try:
-        db = ChoreDB()
-        chores = db.list_all(active_only=True)
+        chores = service.list_chores(active_only=True)
     except Exception as exc:
         logger.error("/chores error: %s", exc)
         await update.message.reply_text("Couldn't load chores. Please try again.")
@@ -1211,14 +602,14 @@ async def cmd_chores(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
 
     lines = ["*Active chores:*\n"]
     for c in chores:
-        lines.append(f"`{c.id}` — {c.name} (due: {c.next_due}, assigned: {c.assigned_to})")
+        lines.append(f"`{c.id}` \u2014 {c.name} (due: {c.next_due}, assigned: {c.assigned_to})")
     await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
 
 
 @authorized_only
 async def cmd_done(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Handle /done <id> — mark a chore as done."""
-    from src.data.db import ChoreDB
+    service: ActionService = context.bot_data["action_service"]
 
     args = context.args
     if not args:
@@ -1232,10 +623,9 @@ async def cmd_done(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         return
 
     try:
-        db = ChoreDB()
-        chore = db.mark_done(chore_id)
+        chore = service.mark_chore_done(chore_id)
         await update.message.reply_text(
-            f"✅ Marked '*{chore.name}*' as done. Next due: {chore.next_due}",
+            f"\u2705 Marked '*{chore.name}*' as done. Next due: {chore.next_due}",
             parse_mode="Markdown",
         )
     except Exception as exc:
@@ -1246,11 +636,10 @@ async def cmd_done(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 @authorized_only
 async def cmd_deletechore(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Handle /deletechore — show active chores as buttons to pick from."""
-    from src.data.db import ChoreDB
+    service: ActionService = context.bot_data["action_service"]
 
     try:
-        db = ChoreDB()
-        chores = db.list_all(active_only=True)
+        chores = service.list_chores(active_only=True)
     except Exception as exc:
         logger.error("/deletechore error: %s", exc)
         await update.message.reply_text("Couldn't load chores. Please try again.")
@@ -1271,52 +660,21 @@ async def cmd_deletechore(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
 
 async def _handle_deletechore_callback(
-    update: Update, context: ContextTypes.DEFAULT_TYPE
+    update: Update, context: ContextTypes.DEFAULT_TYPE,
 ) -> None:
     """Handle the inline button tap to delete a chore."""
-    from src.data.db import ChoreDB
-
-    calendar: CalendarPort = context.bot_data["calendar"]
-
     query = update.callback_query
     await query.answer()
 
-    # Verify the user is authorized
     user = query.from_user
     if user is None or user.id not in settings.ALLOWED_USER_IDS:
         return
 
     chore_id = int(query.data.split(":")[1])
 
-    try:
-        db = ChoreDB()
-        chore = db.get_chore(chore_id)
-        if chore is None or not chore.active:
-            await query.edit_message_text("Chore not found or already deleted.")
-            return
-
-        # Delete the recurring calendar event if linked
-        cal_deleted = False
-        if chore.calendar_event_id:
-            try:
-                await calendar.delete_event(chore.calendar_event_id)
-                cal_deleted = True
-            except CalendarError as exc:
-                logger.error("Failed to delete calendar event for chore #%d: %s", chore_id, exc)
-
-        # Soft-delete the chore in DB
-        db.delete_chore(chore_id)
-
-        msg = f"✅ Chore *{chore.name}* deleted."
-        if cal_deleted:
-            msg += "\nAll linked calendar events have been removed."
-        elif chore.calendar_event_id:
-            msg += "\n⚠️ Couldn't remove the calendar events — please delete them manually."
-        await query.edit_message_text(msg, parse_mode="Markdown")
-
-    except Exception as exc:
-        logger.error("deletechore callback error: %s", exc)
-        await query.edit_message_text("Something went wrong. Please try again.")
+    service: ActionService = context.bot_data["action_service"]
+    response = await service.delete_chore(chore_id)
+    await query.edit_message_text(response.message, parse_mode="Markdown")
 
 
 # ---------------------------------------------------------------------------
@@ -1355,7 +713,7 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         logger.info("Voice transcribed: %s", text[:80])
 
         # Show what was heard, then process
-        await update.message.reply_text(f"🎤 I heard: {text}")
+        await update.message.reply_text(f"\U0001f3a4 I heard: {text}")
         await _process_text(text, update, context)
 
     except Exception as exc:
@@ -1399,9 +757,13 @@ def build_app(
         from src.adapters.telegram_notifier import TelegramNotifier
         notifier = TelegramNotifier(app.bot)
 
-    # Store ports in bot_data for handler access
+    # Create the service layer
+    service = ActionService(calendar)
+
+    # Store ports and service in bot_data for handler access
     app.bot_data["calendar"] = calendar
     app.bot_data["notifier"] = notifier
+    app.bot_data["action_service"] = service
 
     # Commands
     app.add_handler(CommandHandler("start", cmd_start))
