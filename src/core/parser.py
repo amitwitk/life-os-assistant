@@ -15,7 +15,7 @@ import json
 import logging
 from datetime import date
 
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from src.core.llm import complete
 
@@ -40,14 +40,18 @@ class ParsedEvent(BaseModel):
         "mentioned_contacts": []
     }
     """
-    intent: str = "create"
-    event: str
-    date: str          # ISO format YYYY-MM-DD
-    time: str = ""     # HH:MM in 24h format, empty if not specified
-    duration_minutes: int = 60
-    description: str = ""
-    guests: list[str] = []                # explicit email addresses
-    mentioned_contacts: list[str] = []    # person names to resolve via contacts DB
+    intent: str = Field(default="create", description="Action type — always 'create'")
+    event: str = Field(description="Short title for the calendar event")
+    date: str = Field(description="Event date in YYYY-MM-DD format")
+    time: str = Field(default="", description="Start time in HH:MM 24h format. Empty string if not specified")
+    duration_minutes: int = Field(default=60, description="Duration in minutes. Defaults to 60")
+    description: str = Field(default="", description="Optional event description")
+    guests: list[str] = Field(default_factory=list, description="Explicit email addresses to invite")
+    mentioned_contacts: list[str] = Field(default_factory=list, description="Person names mentioned as participants, to resolve via contacts DB")
+
+    @property
+    def log_summary(self) -> str:
+        return f"event creation: {self.event} on {self.date} at {self.time}"
 
 
 class CancelEvent(BaseModel):
@@ -60,9 +64,13 @@ class CancelEvent(BaseModel):
         "date": "2025-02-14"
     }
     """
-    intent: str = "cancel"
-    event_summary: str
-    date: str  # ISO format YYYY-MM-DD
+    intent: str = Field(default="cancel", description="Action type — always 'cancel'")
+    event_summary: str = Field(description="Name/summary of the event to cancel")
+    date: str = Field(description="Date of the event to cancel in YYYY-MM-DD format")
+
+    @property
+    def log_summary(self) -> str:
+        return f"event cancellation: {self.event_summary} on {self.date}"
 
 
 class RescheduleEvent(BaseModel):
@@ -76,10 +84,14 @@ class RescheduleEvent(BaseModel):
         "new_time": "15:00"
     }
     """
-    intent: str = "reschedule"
-    event_summary: str
-    original_date: str  # ISO format YYYY-MM-DD
-    new_time: str       # HH:MM in 24h format
+    intent: str = Field(default="reschedule", description="Action type — always 'reschedule'")
+    event_summary: str = Field(description="Name/summary of the event to reschedule")
+    original_date: str = Field(description="Original date of the event in YYYY-MM-DD format")
+    new_time: str = Field(description="New time for the event in HH:MM 24h format")
+
+    @property
+    def log_summary(self) -> str:
+        return f"event reschedule: {self.event_summary} on {self.original_date} to {self.new_time}"
 
 
 class QueryEvents(BaseModel):
@@ -91,8 +103,12 @@ class QueryEvents(BaseModel):
         "date": "2025-02-14"
     }
     """
-    intent: str = "query"
-    date: str  # ISO format YYYY-MM-DD
+    intent: str = Field(default="query", description="Action type — always 'query'")
+    date: str = Field(description="Date to query in YYYY-MM-DD format")
+
+    @property
+    def log_summary(self) -> str:
+        return f"event query for {self.date}"
 
 
 class CancelAllExcept(BaseModel):
@@ -105,9 +121,13 @@ class CancelAllExcept(BaseModel):
         "exceptions": ["Padel game"]
     }
     """
-    intent: str = "cancel_all_except"
-    date: str          # ISO format YYYY-MM-DD
-    exceptions: list[str]  # event descriptions to KEEP
+    intent: str = Field(default="cancel_all_except", description="Action type — always 'cancel_all_except'")
+    date: str = Field(description="Date of the events in YYYY-MM-DD format")
+    exceptions: list[str] = Field(description="Event descriptions to KEEP (not cancel)")
+
+    @property
+    def log_summary(self) -> str:
+        return f"cancel-all-except on {self.date}, keeping: {self.exceptions}"
 
 
 class AddGuests(BaseModel):
@@ -121,20 +141,125 @@ class AddGuests(BaseModel):
         "guests": ["dan@email.com"]
     }
     """
-    intent: str = "add_guests"
-    event_summary: str
-    date: str          # ISO format YYYY-MM-DD
-    guests: list[str]  # list of email addresses
+    intent: str = Field(default="add_guests", description="Action type — always 'add_guests'")
+    event_summary: str = Field(description="Name/summary of the existing event")
+    date: str = Field(description="Date of the existing event in YYYY-MM-DD format")
+    guests: list[str] = Field(description="Email addresses to add as guests")
+
+    @property
+    def log_summary(self) -> str:
+        return f"add-guests to '{self.event_summary}' on {self.date}: {self.guests}"
 
 
 ParserResponse = ParsedEvent | CancelEvent | RescheduleEvent | QueryEvents | CancelAllExcept | AddGuests
 
+# ---------------------------------------------------------------------------
+# Intent registry — maps intent string to model class
+# ---------------------------------------------------------------------------
+
+INTENT_REGISTRY: dict[str, type[BaseModel]] = {
+    "create": ParsedEvent,
+    "cancel": CancelEvent,
+    "reschedule": RescheduleEvent,
+    "query": QueryEvents,
+    "cancel_all_except": CancelAllExcept,
+    "add_guests": AddGuests,
+}
+
 
 # ---------------------------------------------------------------------------
-# System prompt for LLM
+# System prompt for LLM — schema-driven generation
 # ---------------------------------------------------------------------------
 
-_SYSTEM_PROMPT = """\
+_INTENT_LABELS: dict[str, str] = {
+    "create": "Create Event",
+    "cancel": "Cancel Event",
+    "reschedule": "Reschedule Event",
+    "query": "Query Events",
+    "cancel_all_except": "Cancel All Except",
+    "add_guests": "Add Guests",
+}
+
+_INTENT_TRIGGERS: dict[str, str] = {
+    "create": 'If the user wants to schedule something',
+    "cancel": 'If the user\'s message contains keywords like "cancel", "delete", "remove", "ביטול", "בטל", "למחיקה"',
+    "reschedule": 'If the user\'s message contains keywords like "reschedule", "move", "change time", "לדחות", "להזיז"',
+    "query": 'If the user\'s message is asking about their schedule, what meetings they have, what\'s planned, etc. — keywords like "what meetings", "what do I have", "show me", "מה יש לי", "מה התוכניות"',
+    "cancel_all_except": 'If the user wants to cancel ALL events on a date EXCEPT specific ones (e.g., "cancel everything today except the padel game")',
+    "add_guests": 'If the user wants to add guests/invitees to an EXISTING event (e.g., "Add dan@email.com to the meeting with Dan tomorrow")',
+}
+
+_BEHAVIORAL_RULES: dict[str, list[str]] = {
+    "create": [
+        '"time" must be in 24-hour format. If the user does NOT specify a time, return "time": "".',
+        'This includes cases where the user asks when they are free or available (e.g., "meeting with Shon today", "אני רוצה להיפגש עם שון היום מתי אני פנוי", "I want to meet Dan tomorrow, when am I available?"). These are CREATE intents with "time": "", NOT query intents.',
+        'Interpret relative dates ("tomorrow", "next Monday") relative to today.',
+        '"mentioned_contacts" = list of people\'s NAMES mentioned as participants.\n  e.g., "meeting with Yahav and Dan" → ["Yahav", "Dan"]. Default to [].\n  Only include actual person names, not generic descriptions like "the team".',
+    ],
+    "cancel": [
+        'If the user mentions canceling MULTIPLE specific events, return a separate cancel object for each.',
+    ],
+    "query": [
+        'Interpret relative dates relative to today.',
+        'If the user says "today", "this week", or doesn\'t specify a date, default to today\'s date.',
+    ],
+    "add_guests": [
+        "Only use this when the user explicitly asks to add guests to an EXISTING event. If they're creating a new event with guests, use Function 1 with the \"guests\" field instead.",
+    ],
+}
+
+
+def _generate_schema_line(intent: str, model_cls: type[BaseModel]) -> str:
+    """Auto-generate the JSON schema example line from a Pydantic model."""
+    parts: list[str] = []
+    for name, field_info in model_cls.model_fields.items():
+        annotation = field_info.annotation
+        # Determine placeholder value based on type
+        if name == "intent":
+            parts.append(f'"{name}": "{intent}"')
+        elif annotation is str or (hasattr(annotation, '__origin__') is False and annotation is str):
+            parts.append(f'"{name}": "string"')
+        elif annotation is int:
+            parts.append(f'"{name}": integer')
+        elif hasattr(annotation, '__origin__') and annotation.__origin__ is list:
+            parts.append(f'"{name}": ["string"]')
+        else:
+            parts.append(f'"{name}": "string"')
+    return "{{" + ", ".join(parts) + "}}"
+
+
+def _generate_field_docs(model_cls: type[BaseModel]) -> list[str]:
+    """Auto-generate field documentation lines from Field descriptions."""
+    lines: list[str] = []
+    for name, field_info in model_cls.model_fields.items():
+        if name == "intent":
+            continue
+        desc = field_info.description or ""
+        lines.append(f'- "{name}" = {desc}')
+    return lines
+
+
+def _generate_intent_section(intent: str, model_cls: type[BaseModel], number: int) -> str:
+    """Generate a full prompt section for one intent."""
+    label = _INTENT_LABELS.get(intent, intent.replace("_", " ").title())
+    trigger = _INTENT_TRIGGERS.get(intent, "")
+    schema_line = _generate_schema_line(intent, model_cls)
+    field_docs = _generate_field_docs(model_cls)
+    behavioral = _BEHAVIORAL_RULES.get(intent, [])
+
+    lines = [f"**Function {number}: {label}**"]
+    lines.append(f"{trigger}, use this JSON schema:")
+    lines.append(schema_line)
+    lines.append("")
+    lines.extend(field_docs)
+    for rule in behavioral:
+        lines.append(f"- {rule}")
+    return "\n".join(lines)
+
+
+def _build_system_prompt() -> str:
+    """Assemble the full system prompt from auto-generated and hand-crafted parts."""
+    header = """\
 You are an event extraction engine for a personal assistant.
 Your job: parse the user's natural language message and extract ALL calendar actions.
 A single message may contain multiple actions — extract every one of them.
@@ -142,68 +267,24 @@ A single message may contain multiple actions — extract every one of them.
 Today's date is {today}.
 
 **ALWAYS return a JSON array** `[]`, even for a single action.
+"""
 
-**Function 1: Create Event**
-If the user wants to schedule something, use this JSON schema:
-{{"intent": "create", "event": "string", "date": "YYYY-MM-DD", "time": "HH:MM", "duration_minutes": integer, "description": "string", "guests": ["email@example.com"], "mentioned_contacts": ["PersonName"]}}
+    sections: list[str] = []
+    for number, (intent, model_cls) in enumerate(INTENT_REGISTRY.items(), start=1):
+        sections.append(_generate_intent_section(intent, model_cls, number))
 
-- "event" = short title for the calendar event.
-- "time" must be in 24-hour format. If the user does NOT specify a time, return "time": "".
-- This includes cases where the user asks when they are free or available (e.g., "meeting with Shon today", "אני רוצה להיפגש עם שון היום מתי אני פנוי", "I want to meet Dan tomorrow, when am I available?"). These are CREATE intents with "time": "", NOT query intents.
-- "duration_minutes" defaults to 60 if not mentioned.
-- "guests" = optional list of email addresses to invite. Default to [] if no guests are mentioned.
-- Interpret relative dates ("tomorrow", "next Monday") relative to today.
-- "guests" = list of explicit email addresses mentioned. Default to [].
-- "mentioned_contacts" = list of people's NAMES mentioned as participants.
-  e.g., "meeting with Yahav and Dan" → ["Yahav", "Dan"]. Default to [].
-  Only include actual person names, not generic descriptions like "the team".
-
-**Function 2: Cancel Event**
-If the user's message contains keywords like "cancel", "delete", "remove", "ביטול", "בטל", "למחיקה", use this JSON schema:
-{{"intent": "cancel", "event_summary": "string", "date": "YYYY-MM-DD"}}
-
-- "event_summary" = the name/summary of the event to cancel.
-- "date" = the date of the event to cancel.
-- If the user mentions canceling MULTIPLE specific events, return a separate cancel object for each.
-
-**Function 3: Reschedule Event**
-If the user's message contains keywords like "reschedule", "move", "change time", "לדחות", "להזיז", use this JSON schema:
-{{"intent": "reschedule", "event_summary": "string", "original_date": "YYYY-MM-DD", "new_time": "HH:MM"}}
-
-- "event_summary" = the name/summary of the event to reschedule.
-- "original_date" = the original date of the event.
-- "new_time" = the new time for the event in 24-hour format.
-
-**Function 4: Query Events**
-If the user's message is asking about their schedule, what meetings they have, what's planned, etc. — keywords like "what meetings", "what do I have", "show me", "מה יש לי", "מה התוכניות", use this JSON schema:
-{{"intent": "query", "date": "YYYY-MM-DD"}}
-
-- "date" = the date the user is asking about. Interpret relative dates relative to today.
-- If the user says "today", "this week", or doesn't specify a date, default to today's date.
-
-**Function 5: Cancel All Except**
-If the user wants to cancel ALL events on a date EXCEPT specific ones (e.g., "cancel everything today except the padel game"), use this JSON schema:
-{{"intent": "cancel_all_except", "date": "YYYY-MM-DD", "exceptions": ["event to keep 1", "event to keep 2"]}}
-
-- "date" = the date of the events.
-- "exceptions" = list of event descriptions that should NOT be canceled (the ones to keep).
-
-**Function 6: Add Guests**
-If the user wants to add guests/invitees to an EXISTING event (e.g., "Add dan@email.com to the meeting with Dan tomorrow"), use this JSON schema:
-{{"intent": "add_guests", "event_summary": "string", "date": "YYYY-MM-DD", "guests": ["email@example.com"]}}
-
-- "event_summary" = the name/summary of the existing event.
-- "date" = the date of the existing event.
-- "guests" = list of email addresses to add.
-- Only use this when the user explicitly asks to add guests to an EXISTING event. If they're creating a new event with guests, use Function 1 with the "guests" field instead.
-
+    general_rules = """\
 **General Rules:**
 - Support both Hebrew and English input.
 - A single message may contain multiple actions. Extract ALL of them into the array.
 - Always return a valid JSON array matching the schemas above.
 - If the message does NOT contain any actionable event information, return exactly: []
-- Return ONLY the JSON array (or []). No markdown, no explanation, no extra text.
-"""
+- Return ONLY the JSON array (or []). No markdown, no explanation, no extra text."""
+
+    return header + "\n" + "\n\n".join(sections) + "\n\n" + general_rules + "\n"
+
+
+_SYSTEM_PROMPT = _build_system_prompt()
 
 
 # ---------------------------------------------------------------------------
@@ -303,34 +384,15 @@ async def match_event(user_description: str, events: list[dict]) -> dict | None:
 def _instantiate_action(data: dict) -> ParserResponse | None:
     """Instantiate a single action dict into its typed model, or None if unknown."""
     intent = data.get("intent")
+    model_cls = INTENT_REGISTRY.get(intent)
 
-    if intent == "create":
-        parsed = ParsedEvent(**data)
-        logger.info("Parsed event creation: %s on %s at %s", parsed.event, parsed.date, parsed.time)
-        return parsed
-    if intent == "cancel":
-        parsed = CancelEvent(**data)
-        logger.info("Parsed event cancellation: %s on %s", parsed.event_summary, parsed.date)
-        return parsed
-    if intent == "reschedule":
-        parsed = RescheduleEvent(**data)
-        logger.info("Parsed event reschedule: %s on %s to %s", parsed.event_summary, parsed.original_date, parsed.new_time)
-        return parsed
-    if intent == "query":
-        parsed = QueryEvents(**data)
-        logger.info("Parsed event query for %s", parsed.date)
-        return parsed
-    if intent == "cancel_all_except":
-        parsed = CancelAllExcept(**data)
-        logger.info("Parsed cancel-all-except on %s, keeping: %s", parsed.date, parsed.exceptions)
-        return parsed
-    if intent == "add_guests":
-        parsed = AddGuests(**data)
-        logger.info("Parsed add-guests to '%s' on %s: %s", parsed.event_summary, parsed.date, parsed.guests)
-        return parsed
+    if not model_cls:
+        _handle_unknown_intent(intent)
+        return None
 
-    _handle_unknown_intent(intent)
-    return None
+    parsed = model_cls(**data)
+    logger.info("Parsed %s", parsed.log_summary)
+    return parsed
 
 
 async def parse_message(user_message: str) -> list[ParserResponse]:

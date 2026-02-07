@@ -412,3 +412,117 @@ class TestMentionedContacts:
         )
         assert p.mentioned_contacts == []
         assert p.guests == []
+
+
+# ---------------------------------------------------------------------------
+# Tests for intent registry
+# ---------------------------------------------------------------------------
+
+
+class TestIntentRegistry:
+    def test_registry_covers_all_models(self):
+        """Every type in ParserResponse union is in the registry."""
+        from src.core.parser import INTENT_REGISTRY
+        import typing
+
+        # Get all types from the ParserResponse union
+        response_types = set(typing.get_args(
+            ParsedEvent | CancelEvent | RescheduleEvent | QueryEvents | CancelAllExcept | AddGuests
+        ))
+        registry_types = set(INTENT_REGISTRY.values())
+        assert response_types == registry_types
+
+    def test_instantiate_via_registry(self):
+        """Round-trip: dict → model via registry lookup."""
+        from src.core.parser import INTENT_REGISTRY
+
+        data = {
+            "intent": "create",
+            "event": "Lunch",
+            "date": "2026-02-14",
+            "time": "12:00",
+            "duration_minutes": 60,
+            "description": "",
+        }
+        model_cls = INTENT_REGISTRY["create"]
+        parsed = model_cls(**data)
+        assert isinstance(parsed, ParsedEvent)
+        assert parsed.event == "Lunch"
+
+    def test_registry_cancel(self):
+        from src.core.parser import INTENT_REGISTRY
+
+        data = {"intent": "cancel", "event_summary": "Dentist", "date": "2026-02-14"}
+        parsed = INTENT_REGISTRY["cancel"](**data)
+        assert isinstance(parsed, CancelEvent)
+        assert parsed.event_summary == "Dentist"
+
+
+# ---------------------------------------------------------------------------
+# Tests for schema-driven prompt
+# ---------------------------------------------------------------------------
+
+
+class TestSchemaPrompt:
+    def test_prompt_includes_all_fields(self):
+        """Every model field name appears in the auto-generated prompt."""
+        from src.core.parser import _SYSTEM_PROMPT, INTENT_REGISTRY
+
+        for intent, model_cls in INTENT_REGISTRY.items():
+            for field_name in model_cls.model_fields:
+                assert field_name in _SYSTEM_PROMPT, (
+                    f"Field '{field_name}' from {model_cls.__name__} not found in prompt"
+                )
+
+    def test_prompt_includes_today_placeholder(self):
+        """The {today} placeholder is present for date injection."""
+        from src.core.parser import _SYSTEM_PROMPT
+
+        assert "{today}" in _SYSTEM_PROMPT
+
+    def test_prompt_includes_all_intent_labels(self):
+        """Every intent label (e.g., 'Create Event') appears in the prompt."""
+        from src.core.parser import _SYSTEM_PROMPT, _INTENT_LABELS
+
+        for label in _INTENT_LABELS.values():
+            assert label in _SYSTEM_PROMPT, f"Label '{label}' not found in prompt"
+
+    def test_prompt_includes_general_rules(self):
+        """General rules section is present."""
+        from src.core.parser import _SYSTEM_PROMPT
+
+        assert "General Rules" in _SYSTEM_PROMPT
+        assert "Hebrew and English" in _SYSTEM_PROMPT
+
+
+# ---------------------------------------------------------------------------
+# Tests for log_summary
+# ---------------------------------------------------------------------------
+
+
+class TestLogSummary:
+    def test_parsed_event_log_summary(self):
+        p = ParsedEvent(event="Lunch", date="2026-02-14", time="12:00")
+        assert "Lunch" in p.log_summary
+        assert "2026-02-14" in p.log_summary
+
+    def test_cancel_event_log_summary(self):
+        c = CancelEvent(event_summary="Dentist", date="2026-02-14")
+        assert "Dentist" in c.log_summary
+        assert "cancellation" in c.log_summary
+
+    def test_reschedule_event_log_summary(self):
+        from src.core.parser import RescheduleEvent
+        r = RescheduleEvent(event_summary="Meeting", original_date="2026-02-14", new_time="15:00")
+        assert "Meeting" in r.log_summary
+        assert "15:00" in r.log_summary
+
+    def test_query_events_log_summary(self):
+        from src.core.parser import QueryEvents
+        q = QueryEvents(date="2026-02-14")
+        assert "2026-02-14" in q.log_summary
+
+    def test_add_guests_log_summary(self):
+        a = AddGuests(event_summary="Meeting", date="2026-02-14", guests=["dan@email.com"])
+        assert "Meeting" in a.log_summary
+        assert "add-guests" in a.log_summary

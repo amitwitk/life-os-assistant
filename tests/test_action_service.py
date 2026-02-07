@@ -937,7 +937,7 @@ class TestProcessTextSlotSuggestion:
     @pytest.mark.asyncio
     async def test_batch_with_missing_time_fails_that_action(self):
         from src.core.parser import ParsedEvent
-        from src.core.conflict_checker import ConflictResult
+        from src.core.conflict_checker import ConflictResult, FreeSlotResult
 
         service, cal = _make_service()
         cal.add_event = AsyncMock(return_value={"htmlLink": ""})
@@ -947,9 +947,14 @@ class TestProcessTextSlotSuggestion:
             ParsedEvent(event="Meeting B", date="2026-02-08", time=""),
         ]
         no_conflict = ConflictResult(has_conflict=False)
+        free_result = FreeSlotResult(
+            suggested=["09:00", "12:00"],
+            all_available=["09:00", "12:00"],
+        )
 
         with patch("src.core.parser.parse_message", AsyncMock(return_value=actions)), \
-             patch("src.core.conflict_checker.check_conflict", AsyncMock(return_value=no_conflict)):
+             patch("src.core.conflict_checker.check_conflict", AsyncMock(return_value=no_conflict)), \
+             patch("src.core.conflict_checker.get_free_slots", AsyncMock(return_value=free_result)):
             response = await service.process_text("Two meetings")
 
         assert isinstance(response, BatchSummaryResponse)
@@ -1290,3 +1295,284 @@ class TestContactResolution:
 
         assert isinstance(response, ContactPromptResponse)
         assert response.contact_name == "Yahav"
+
+
+# ---------------------------------------------------------------------------
+# Slot suggestion + contact resolution integration
+# ---------------------------------------------------------------------------
+
+
+class TestSlotSuggestionWithContacts:
+    """Verify contacts are resolved before slot suggestions are generated."""
+
+    @pytest.mark.asyncio
+    async def test_known_contact_no_time_resolves_then_suggests_slots(self, contact_db):
+        """Known contact + empty time → SlotSuggestionResponse with guest email in pending."""
+        from src.core.parser import ParsedEvent
+        from src.core.conflict_checker import FreeSlotResult
+
+        contact_db.add_contact("Ofek", "ofek@email.com")
+        service, cal = _make_service_with_contacts(contact_db=contact_db)
+
+        parsed = ParsedEvent(
+            event="Meeting with Ofek", date="2026-02-08", time="",
+            mentioned_contacts=["Ofek"],
+        )
+        free_result = FreeSlotResult(
+            suggested=["09:00", "12:00", "16:00"],
+            all_available=["09:00", "12:00", "16:00"],
+        )
+
+        with patch("src.core.parser.parse_message", AsyncMock(return_value=[parsed])), \
+             patch("src.core.conflict_checker.get_free_slots", AsyncMock(return_value=free_result)):
+            response = await service.process_text("Meeting with Ofek today")
+
+        assert isinstance(response, SlotSuggestionResponse)
+        assert response.kind == ResponseKind.SLOT_SUGGESTION
+        # Guest email should be in the pending event JSON
+        pending_json = response.pending.parsed_event_json
+        assert "ofek@email.com" in pending_json["guests"]
+        assert pending_json["mentioned_contacts"] == []
+
+    @pytest.mark.asyncio
+    async def test_unknown_contact_no_time_prompts_for_email_first(self, contact_db):
+        """Unknown contact + empty time → ContactPromptResponse (not SlotSuggestionResponse)."""
+        from src.core.parser import ParsedEvent
+
+        service, cal = _make_service_with_contacts(contact_db=contact_db)
+
+        parsed = ParsedEvent(
+            event="Meeting with Ofek", date="2026-02-08", time="",
+            mentioned_contacts=["Ofek"],
+        )
+
+        with patch("src.core.parser.parse_message", AsyncMock(return_value=[parsed])):
+            response = await service.process_text("Meeting with Ofek today")
+
+        assert isinstance(response, ContactPromptResponse)
+        assert response.kind == ResponseKind.CONTACT_PROMPT
+        assert response.contact_name == "Ofek"
+
+    @pytest.mark.asyncio
+    async def test_resolve_contact_then_slot_suggestion(self, contact_db):
+        """After resolve_contact() completes, re-entry returns SlotSuggestionResponse with guest."""
+        from src.core.conflict_checker import FreeSlotResult
+
+        service, cal = _make_service_with_contacts(contact_db=contact_db)
+
+        pending = PendingContactResolution(
+            action_type="create",
+            parsed_action_json={
+                "intent": "create", "event": "Meeting with Ofek",
+                "date": "2026-02-08", "time": "",
+                "duration_minutes": 60, "description": "",
+                "guests": [], "mentioned_contacts": ["Ofek"],
+            },
+            resolved_contacts={},
+            unresolved_contacts=["Ofek"],
+            current_asking="Ofek",
+        )
+
+        free_result = FreeSlotResult(
+            suggested=["10:00", "14:00"],
+            all_available=["10:00", "14:00"],
+        )
+
+        with patch("src.core.conflict_checker.get_free_slots", AsyncMock(return_value=free_result)):
+            response = await service.resolve_contact(pending, "ofek@email.com")
+
+        assert isinstance(response, SlotSuggestionResponse)
+        assert response.kind == ResponseKind.SLOT_SUGGESTION
+        pending_json = response.pending.parsed_event_json
+        assert "ofek@email.com" in pending_json["guests"]
+        assert pending_json["mentioned_contacts"] == []
+
+    @pytest.mark.asyncio
+    async def test_full_flow_contact_then_slot_then_create(self, contact_db):
+        """End-to-end: unknown contact → prompt → resolve → slots → pick → event created with guest."""
+        from src.core.parser import ParsedEvent
+        from src.core.conflict_checker import ConflictResult, FreeSlotResult
+
+        service, cal = _make_service_with_contacts(contact_db=contact_db)
+        cal.add_event = AsyncMock(return_value={"htmlLink": "https://cal/1"})
+
+        # Step 1: user sends message with unknown contact, no time
+        parsed = ParsedEvent(
+            event="Meeting with Ofek", date="2026-02-08", time="",
+            mentioned_contacts=["Ofek"],
+        )
+        with patch("src.core.parser.parse_message", AsyncMock(return_value=[parsed])):
+            resp1 = await service.process_text("Meeting with Ofek today")
+
+        assert isinstance(resp1, ContactPromptResponse)
+
+        # Step 2: user provides email → resolve → should get slot suggestions
+        free_result = FreeSlotResult(
+            suggested=["10:00", "14:00"],
+            all_available=["10:00", "14:00"],
+        )
+        with patch("src.core.conflict_checker.get_free_slots", AsyncMock(return_value=free_result)):
+            resp2 = await service.resolve_contact(resp1.pending, "ofek@email.com")
+
+        assert isinstance(resp2, SlotSuggestionResponse)
+        assert "ofek@email.com" in resp2.pending.parsed_event_json["guests"]
+
+        # Step 3: user picks a slot → event created with guest
+        no_conflict = ConflictResult(has_conflict=False)
+        with patch("src.core.conflict_checker.check_conflict", AsyncMock(return_value=no_conflict)):
+            resp3 = await service.select_slot(resp2.pending, "10:00")
+
+        assert isinstance(resp3, SuccessResponse)
+        call_args = cal.add_event.call_args[0][0]
+        assert "ofek@email.com" in call_args.guests
+
+    @pytest.mark.asyncio
+    async def test_slot_suggestion_message_includes_attendees(self, contact_db):
+        """Message text contains attendee email when guests are present."""
+        from src.core.parser import ParsedEvent
+        from src.core.conflict_checker import FreeSlotResult
+
+        contact_db.add_contact("Ofek", "ofek@email.com")
+        service, cal = _make_service_with_contacts(contact_db=contact_db)
+
+        parsed = ParsedEvent(
+            event="Meeting with Ofek", date="2026-02-08", time="",
+            mentioned_contacts=["Ofek"],
+        )
+        free_result = FreeSlotResult(
+            suggested=["09:00"],
+            all_available=["09:00"],
+        )
+
+        with patch("src.core.parser.parse_message", AsyncMock(return_value=[parsed])), \
+             patch("src.core.conflict_checker.get_free_slots", AsyncMock(return_value=free_result)):
+            response = await service.process_text("Meeting with Ofek today")
+
+        assert isinstance(response, SlotSuggestionResponse)
+        assert "ofek@email.com" in response.message
+
+
+# ---------------------------------------------------------------------------
+# Pipeline architecture tests
+# ---------------------------------------------------------------------------
+
+
+class TestCreatePipeline:
+    @pytest.mark.asyncio
+    async def test_pipeline_skips_inapplicable_enrichers(self):
+        """No contacts, has time → goes straight to conflict check → creates."""
+        from src.core.parser import ParsedEvent
+        from src.core.conflict_checker import ConflictResult
+
+        service, cal = _make_service()
+        cal.add_event = AsyncMock(return_value={"htmlLink": "https://cal/1"})
+
+        parsed = ParsedEvent(event="Lunch", date="2026-02-08", time="12:00")
+        no_conflict = ConflictResult(has_conflict=False)
+
+        with patch("src.core.conflict_checker.check_conflict", AsyncMock(return_value=no_conflict)):
+            response = await service._run_create_pipeline(parsed)
+
+        assert isinstance(response, SuccessResponse)
+        assert "Lunch" in response.message
+        cal.add_event.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_pipeline_stops_at_first_pause_contacts(self):
+        """Unknown contact → ContactPromptResponse, never reaches slot/conflict."""
+        from src.core.parser import ParsedEvent
+
+        service, cal = _make_service()  # no contact_db → all contacts unresolved
+
+        parsed = ParsedEvent(
+            event="Meeting", date="2026-02-08", time="14:00",
+            mentioned_contacts=["Unknown"],
+        )
+
+        response = await service._run_create_pipeline(parsed)
+
+        assert isinstance(response, ContactPromptResponse)
+        assert response.contact_name == "Unknown"
+        # Calendar should never be called
+        cal.add_event.assert_not_called() if hasattr(cal.add_event, 'assert_not_called') else None
+
+    @pytest.mark.asyncio
+    async def test_pipeline_stops_at_slot_suggestion(self):
+        """No time → SlotSuggestionResponse, never reaches conflict check."""
+        from src.core.parser import ParsedEvent
+        from src.core.conflict_checker import FreeSlotResult
+
+        service, cal = _make_service()
+
+        parsed = ParsedEvent(event="Meeting", date="2026-02-08", time="")
+        free_result = FreeSlotResult(
+            suggested=["09:00", "14:00"],
+            all_available=["09:00", "14:00"],
+        )
+
+        with patch("src.core.conflict_checker.get_free_slots", AsyncMock(return_value=free_result)):
+            response = await service._run_create_pipeline(parsed)
+
+        assert isinstance(response, SlotSuggestionResponse)
+        assert len(response.slots) == 2
+
+    @pytest.mark.asyncio
+    async def test_batch_pipeline_converts_pauses_to_errors(self):
+        """Batch pipeline converts SlotSuggestionResponse to ActionResult error."""
+        from src.core.parser import ParsedEvent
+        from src.core.conflict_checker import FreeSlotResult
+
+        service, cal = _make_service()
+
+        parsed = ParsedEvent(event="Meeting", date="2026-02-08", time="")
+        free_result = FreeSlotResult(
+            suggested=["09:00"],
+            all_available=["09:00"],
+        )
+
+        with patch("src.core.conflict_checker.get_free_slots", AsyncMock(return_value=free_result)):
+            result = await service._run_create_pipeline_batch(parsed)
+
+        assert isinstance(result, ActionResult)
+        assert not result.success
+        assert "No time specified" in result.error_message
+
+    @pytest.mark.asyncio
+    async def test_batch_pipeline_contact_pause_to_error(self):
+        """Batch pipeline converts ContactPromptResponse to ActionResult error."""
+        from src.core.parser import ParsedEvent
+
+        service, cal = _make_service()  # no contact_db
+
+        parsed = ParsedEvent(
+            event="Meeting", date="2026-02-08", time="14:00",
+            mentioned_contacts=["Unknown"],
+        )
+
+        result = await service._run_create_pipeline_batch(parsed)
+
+        assert isinstance(result, ActionResult)
+        assert not result.success
+        assert "Unknown contact" in result.error_message
+
+    @pytest.mark.asyncio
+    async def test_batch_pipeline_conflict_pause_to_error(self):
+        """Batch pipeline converts ConflictPromptResponse to ActionResult error."""
+        from src.core.parser import ParsedEvent
+        from src.core.conflict_checker import ConflictResult
+
+        service, cal = _make_service()
+
+        parsed = ParsedEvent(event="Meeting", date="2026-02-08", time="14:00")
+        conflict = ConflictResult(
+            has_conflict=True,
+            conflicting_events=[{"summary": "Blocker", "start_time": "14:00", "end_time": "15:00"}],
+            suggested_time="15:00",
+        )
+
+        with patch("src.core.conflict_checker.check_conflict", AsyncMock(return_value=conflict)):
+            result = await service._run_create_pipeline_batch(parsed)
+
+        assert isinstance(result, ActionResult)
+        assert not result.success
+        assert "Conflict with: Blocker" in result.error_message
